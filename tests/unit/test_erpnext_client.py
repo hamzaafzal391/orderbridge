@@ -3,6 +3,7 @@ from decimal import Decimal
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from app.clients.erpnext import ERPNextClient
 from app.clients.erpnext_errors import (
@@ -14,8 +15,8 @@ from app.clients.erpnext_errors import (
     ERPNextResponseError,
     ERPNextTemporaryError,
 )
-from app.clients.erpnext_models import ERPNextCustomer
 from app.config import Settings
+from app.models import Customer
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -28,7 +29,7 @@ def make_settings() -> Settings:
     )
 
 
-def get_customer_with(handler: Handler, name: str = "Anyone") -> ERPNextCustomer:
+def get_customer_with(handler: Handler, name: str = "Anyone") -> Customer:
     """Run get_customer against a fake ERPNext defined by `handler`."""
     with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
         client = ERPNextClient(settings=make_settings(), http_client=http_client)
@@ -43,7 +44,7 @@ def customer_response(data: object) -> Handler:
     return respond(200, json={"data": data})
 
 
-def test_get_customer_returns_typed_customer() -> None:
+def test_get_customer_returns_internal_customer() -> None:
     def handle_request(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == (
             "http://erpnext.test/api/resource/Customer/NorthStar%20Mechanical%20LLC"
@@ -65,11 +66,11 @@ def test_get_customer_returns_typed_customer() -> None:
 
     customer = get_customer_with(handle_request, "NorthStar Mechanical LLC")
 
-    assert isinstance(customer, ERPNextCustomer)
+    assert isinstance(customer, Customer)
     assert customer.name == "NorthStar Mechanical LLC"
     assert customer.customer_type == "Company"
     assert customer.credit_limits[0].company == "MetroAir Supply"
-    assert customer.credit_limits[0].credit_limit == Decimal(50000)
+    assert customer.credit_limits[0].amount == Decimal(50000)
 
 
 def test_missing_credit_limits_defaults_to_empty_list() -> None:
@@ -77,6 +78,32 @@ def test_missing_credit_limits_defaults_to_empty_list() -> None:
 
     assert customer.credit_limits == []
     assert customer.customer_type is None
+
+
+def test_all_credit_limits_are_kept_in_order() -> None:
+    customer = get_customer_with(
+        customer_response(
+            {
+                "name": "Acme",
+                "credit_limits": [
+                    {"company": "First Co", "credit_limit": 100},
+                    {"company": "Second Co", "credit_limit": 250.5},
+                ],
+            }
+        )
+    )
+
+    assert [(limit.company, limit.amount) for limit in customer.credit_limits] == [
+        ("First Co", Decimal(100)),
+        ("Second Co", Decimal("250.5")),
+    ]
+
+
+def test_returned_customer_is_immutable() -> None:
+    customer = get_customer_with(customer_response({"name": "Acme"}))
+
+    with pytest.raises(ValidationError):
+        customer.name = "Changed"  # type: ignore[misc]
 
 
 @pytest.mark.parametrize(

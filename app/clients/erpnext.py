@@ -15,6 +15,7 @@ from app.clients.erpnext_errors import (
 )
 from app.clients.erpnext_models import ERPNextCustomer
 from app.config import Settings, get_settings
+from app.models import CreditLimit, Customer
 
 TEMPORARY_STATUS_CODES = {500, 502, 503, 504}
 
@@ -42,7 +43,7 @@ class ERPNextClient:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
-    def get_customer(self, customer_name: str) -> ERPNextCustomer:
+    def get_customer(self, customer_name: str) -> Customer:
         encoded_name = quote(customer_name, safe="")
         url = f"{self.base_url}/api/resource/Customer/{encoded_name}"
 
@@ -68,7 +69,19 @@ class ERPNextClient:
             ) from error
 
         self._raise_for_status(response)
-        return self._parse_customer(response)
+        return self._to_customer(self._parse_customer(response))
+
+    @staticmethod
+    def _to_customer(erpnext_customer: ERPNextCustomer) -> Customer:
+        """Convert ERPNext's shape into OrderBridge's vendor-independent Customer."""
+        return Customer(
+            name=erpnext_customer.name,
+            customer_type=erpnext_customer.customer_type,
+            credit_limits=[
+                CreditLimit(company=limit.company, amount=limit.credit_limit)
+                for limit in erpnext_customer.credit_limits
+            ],
+        )
 
     @staticmethod
     def _raise_for_status(response: httpx.Response) -> None:
