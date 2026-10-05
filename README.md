@@ -38,7 +38,7 @@ Business logic never talks to a vendor API directly. Vendor-specific code lives 
 |---|---|
 | ERPNext customer client (typed models, classified errors, injectable HTTP client) | Done |
 | Unit tests with a fake HTTP transport (no live services) and CI on every PR | Done |
-| Internal customer model, independent of any vendor | Planned |
+| Internal `Customer` model, independent of any vendor | Done |
 | GoHighLevel client | Planned |
 | Idempotency, retries with backoff, duplicate-event handling | Planned |
 | API (FastAPI), PostgreSQL storage, structured logs, replay and reconciliation | Planned |
@@ -93,10 +93,11 @@ with ERPNextClient() as client:
 ```
 app/
 ├── config.py               # settings loaded from environment / .env
+├── models.py               # OrderBridge's own vendor-independent models (Customer)
 └── clients/
-    ├── erpnext.py          # ERPNext HTTP client
+    ├── erpnext.py          # ERPNext HTTP client; converts ERPNext data to Customer
     ├── erpnext_errors.py   # error hierarchy
-    └── erpnext_models.py   # typed response models
+    └── erpnext_models.py   # ERPNext response shapes used for validation
 tests/unit/                 # fast tests, no network
 docs/adr/                   # architecture decision records
 .github/workflows/ci.yml    # lint, format check and tests on every PR
