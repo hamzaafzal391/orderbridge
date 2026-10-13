@@ -118,4 +118,8 @@ class GHLClient:
         if not name:
             raise GHLResponseError("Contact has no company name, person name or display name")
 
-        return Customer(name=name, customer_type="Company" if company else "Individual")
+        return Customer(
+            name=name,
+            customer_type="Company" if company else "Individual",
+            email=(contact.email or "").strip() or None,
+        )

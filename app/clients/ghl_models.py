@@ -12,3 +12,4 @@ class GHLContact(BaseModel):
     first_name: str | None = Field(default=None, alias="firstName")
     last_name: str | None = Field(default=None, alias="lastName")
     company_name: str | None = Field(default=None, alias="companyName")
+    email: str | None = None

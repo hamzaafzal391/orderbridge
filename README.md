@@ -40,6 +40,7 @@ Business logic never talks to a vendor API directly. Vendor-specific code lives 
 | Unit tests with a fake HTTP transport (no live services) and CI on every PR | Done |
 | Internal `Customer` model, independent of any vendor | Done |
 | GoHighLevel contact client (read-only), mapped to `Customer` | Done |
+| Read-only matching of a CRM contact to an ERP customer by email | Done |
 | Idempotency, retries with backoff, duplicate-event handling | Planned |
 | API (FastAPI), PostgreSQL storage, structured logs, replay and reconciliation | Planned |
 | Docker and AWS deployment | Planned |
@@ -94,6 +95,8 @@ with ERPNextClient() as client:
 app/
 ├── config.py               # settings loaded from environment / .env
 ├── models.py               # OrderBridge's own vendor-independent models (Customer)
+├── services/
+│   └── customer_matching.py  # business logic: match a CRM contact to an ERP customer
 └── clients/
     ├── erpnext.py          # ERPNext HTTP client; converts ERPNext data to Customer
     ├── erpnext_errors.py   # ERPNext error hierarchy
