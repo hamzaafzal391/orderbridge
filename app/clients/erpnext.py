@@ -17,6 +17,7 @@ from app.clients.erpnext_errors import (
 from app.clients.erpnext_models import ERPNextCustomer
 from app.config import Settings, get_settings
 from app.models import CreditLimit, Customer
+from app.retry import RetryPolicy, call_with_retries, parse_retry_after
 
 TEMPORARY_STATUS_CODES = {500, 502, 503, 504}
 # More than one match already means "ambiguous"; no need to fetch an unbounded list.
@@ -28,8 +29,10 @@ class ERPNextClient:
         self,
         settings: Settings | None = None,
         http_client: httpx.Client | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         self.settings = settings or get_settings()
+        self.retry_policy = retry_policy or RetryPolicy()
         self.base_url = str(self.settings.erpnext_base_url).rstrip("/")
         # Only close an httpx client we created ourselves; an injected one
         # belongs to the caller.
@@ -82,7 +85,11 @@ class ERPNextClient:
         return [self.get_customer(name) for name in customer_names]
 
     def _get(self, url: str, params: dict[str, str | int] | None = None) -> httpx.Response:
-        """Send an authenticated GET and return the response, or raise a classified error."""
+        """Send an authenticated GET, retrying temporary failures (reads are safe to repeat)."""
+        return call_with_retries(lambda: self._get_once(url, params), self.retry_policy)
+
+    def _get_once(self, url: str, params: dict[str, str | int] | None) -> httpx.Response:
+        """One attempt: return the response, or raise a classified error."""
         api_key = self.settings.erpnext_api_key.get_secret_value()
         api_secret = self.settings.erpnext_api_secret.get_secret_value()
 
@@ -156,7 +163,11 @@ class ERPNextClient:
         elif status == 404:
             error = ERPNextNotFoundError(message, status_code=status)
         elif status == 429:
-            error = ERPNextRateLimitError(message, status_code=status)
+            error = ERPNextRateLimitError(
+                message,
+                status_code=status,
+                retry_after=parse_retry_after(response.headers.get("Retry-After")),
+            )
         elif status in TEMPORARY_STATUS_CODES:
             error = ERPNextTemporaryError(message, status_code=status)
         else:

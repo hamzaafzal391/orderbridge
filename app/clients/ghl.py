@@ -16,6 +16,7 @@ from app.clients.ghl_errors import (
 from app.clients.ghl_models import GHLContact
 from app.config import Settings, get_settings
 from app.models import Customer
+from app.retry import RetryPolicy, call_with_retries, parse_retry_after
 
 TEMPORARY_STATUS_CODES = {500, 502, 503, 504}
 
@@ -25,8 +26,10 @@ class GHLClient:
         self,
         settings: Settings | None = None,
         http_client: httpx.Client | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         self.settings = settings or get_settings()
+        self.retry_policy = retry_policy or RetryPolicy()
         self.base_url = str(self.settings.ghl_base_url).rstrip("/")
         # Only close an httpx client we created ourselves; an injected one
         # belongs to the caller.
@@ -45,7 +48,15 @@ class GHLClient:
 
     def get_contact(self, contact_id: str) -> Customer:
         encoded_id = quote(contact_id, safe="")
-        url = f"{self.base_url}/contacts/{encoded_id}"
+        response = self._get(f"{self.base_url}/contacts/{encoded_id}")
+        return self._to_customer(self._parse_contact(response))
+
+    def _get(self, url: str) -> httpx.Response:
+        """Send an authenticated GET, retrying temporary failures (reads are safe to repeat)."""
+        return call_with_retries(lambda: self._get_once(url), self.retry_policy)
+
+    def _get_once(self, url: str) -> httpx.Response:
+        """One attempt: return the response, or raise a classified error."""
         token = self.settings.ghl_api_token.get_secret_value()
 
         try:
@@ -68,7 +79,7 @@ class GHLClient:
             ) from error
 
         self._raise_for_status(response)
-        return self._to_customer(self._parse_contact(response))
+        return response
 
     @staticmethod
     def _raise_for_status(response: httpx.Response) -> None:
@@ -83,7 +94,11 @@ class GHLClient:
         elif status == 404:
             error = GHLNotFoundError(message, status_code=status)
         elif status == 429:
-            error = GHLRateLimitError(message, status_code=status)
+            error = GHLRateLimitError(
+                message,
+                status_code=status,
+                retry_after=parse_retry_after(response.headers.get("Retry-After")),
+            )
         elif status in TEMPORARY_STATUS_CODES:
             error = GHLTemporaryError(message, status_code=status)
         else:

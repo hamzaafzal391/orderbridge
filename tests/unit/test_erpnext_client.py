@@ -17,8 +17,12 @@ from app.clients.erpnext_errors import (
 )
 from app.config import Settings
 from app.models import Customer
+from app.retry import RetryPolicy
 
 Handler = Callable[[httpx.Request], httpx.Response]
+
+# Most tests exercise a single attempt; retry behaviour has its own tests below.
+NO_RETRY = RetryPolicy(max_attempts=1)
 
 
 def make_settings() -> Settings:
@@ -33,7 +37,9 @@ def make_settings() -> Settings:
 def get_customer_with(handler: Handler, name: str = "Anyone") -> Customer:
     """Run get_customer against a fake ERPNext defined by `handler`."""
     with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
-        client = ERPNextClient(settings=make_settings(), http_client=http_client)
+        client = ERPNextClient(
+            settings=make_settings(), http_client=http_client, retry_policy=NO_RETRY
+        )
         return client.get_customer(name)
 
 
@@ -253,7 +259,9 @@ def customer_link(name: str) -> dict[str, str]:
 
 def find_customers_with(handler: Handler, email: str = "sam@example.com") -> list[Customer]:
     with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
-        client = ERPNextClient(settings=make_settings(), http_client=http_client)
+        client = ERPNextClient(
+            settings=make_settings(), http_client=http_client, retry_policy=NO_RETRY
+        )
         return client.find_customers_by_email(email)
 
 
@@ -403,3 +411,137 @@ def test_find_customers_by_email_rejects_malformed_contact_record(contact_body: 
 
     with pytest.raises(ERPNextResponseError):
         find_customers_with(handle_request)
+
+
+class Flaky:
+    """A fake server that fails with `failures` in turn (a status code or an exception), then succeeds."""
+
+    def __init__(
+        self, failures: list[int | Exception], ok: Handler, headers: dict[str, str] | None = None
+    ):
+        self.failures = list(failures)
+        self.ok = ok
+        self.headers = headers or {}
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if self.failures:
+            failure = self.failures.pop(0)
+            if isinstance(failure, Exception):
+                raise failure
+            return httpx.Response(failure, headers=self.headers)
+        return self.ok(request)
+
+
+def retrying(handler: Handler, sleeps: list[float], max_attempts: int = 3) -> ERPNextClient:
+    """A client whose retry waits are recorded instead of slept (the caller closes it)."""
+    policy = RetryPolicy(max_attempts=max_attempts, sleep=sleeps.append, jitter=lambda delay: delay)
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    return ERPNextClient(settings=make_settings(), http_client=http_client, retry_policy=policy)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [503, 502, 500, 504, 429, httpx.ConnectTimeout("timed out"), httpx.ConnectError("refused")],
+    ids=["503", "502", "500", "504", "429", "timeout", "connection-error"],
+)
+def test_temporary_failure_is_retried_then_succeeds(failure: int | Exception) -> None:
+    server = Flaky([failure], customer_response({"name": "Acme"}))
+    sleeps: list[float] = []
+
+    with retrying(server, sleeps) as client:
+        customer = client.get_customer("Acme")
+
+    assert customer.name == "Acme"
+    assert len(server.requests) == 2
+    assert sleeps == [0.5]
+
+
+def test_retry_after_header_sets_the_wait() -> None:
+    server = Flaky([429], customer_response({"name": "Acme"}), headers={"Retry-After": "2"})
+    sleeps: list[float] = []
+
+    with retrying(server, sleeps) as client:
+        client.get_customer("Acme")
+
+    assert sleeps == [2.0]
+
+
+def test_rate_limit_error_carries_retry_after() -> None:
+    server = Flaky([429], respond(200), headers={"Retry-After": "7"})
+
+    with (
+        retrying(server, [], max_attempts=1) as client,
+        pytest.raises(ERPNextRateLimitError) as error,
+    ):
+        client.get_customer("Acme")
+
+    assert error.value.retry_after == 7.0
+
+
+def test_persistent_temporary_failure_gives_up_after_max_attempts() -> None:
+    server = Flaky([503, 503, 503, 503], respond(200))
+    sleeps: list[float] = []
+
+    with retrying(server, sleeps) as client, pytest.raises(ERPNextTemporaryError) as error:
+        client.get_customer("Acme")
+
+    assert error.value.status_code == 503
+    assert len(server.requests) == 3
+    assert sleeps == [0.5, 1.0]
+
+
+@pytest.mark.parametrize("failure", [401, 403, 404, 400, 409], ids=str)
+def test_permanent_errors_are_not_retried(failure: int) -> None:
+    server = Flaky([failure, failure], customer_response({"name": "Acme"}))
+    sleeps: list[float] = []
+
+    with retrying(server, sleeps) as client, pytest.raises(ERPNextError):
+        client.get_customer("Acme")
+
+    assert len(server.requests) == 1
+    assert sleeps == []
+
+
+def test_malformed_response_is_not_retried() -> None:
+    server = Flaky([], respond(200, content=b"<html>not json</html>"))
+
+    with retrying(server, []) as client, pytest.raises(ERPNextResponseError):
+        client.get_customer("Acme")
+
+    assert len(server.requests) == 1
+
+
+def test_find_customers_retries_only_the_failing_step() -> None:
+    inner = fake_erpnext({"Contact A": [customer_link("Acme")]})
+    seen: list[str] = []
+    failed_once: list[bool] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/api/resource/Contact/Contact A" and not failed_once:
+            failed_once.append(True)
+            return httpx.Response(503)
+        return inner(request)
+
+    with retrying(handle_request, []) as client:
+        customers = client.find_customers_by_email("sam@example.com")
+
+    assert [customer.name for customer in customers] == ["Acme"]
+    assert seen == [
+        "/api/resource/Contact",
+        "/api/resource/Contact/Contact A",  # failed
+        "/api/resource/Contact/Contact A",  # retried
+        "/api/resource/Customer/Acme",
+    ]
+
+
+def test_retries_never_leak_secrets_into_the_final_error() -> None:
+    server = Flaky([503, 503, 503], respond(200))
+
+    with retrying(server, []) as client, pytest.raises(ERPNextTemporaryError) as error:
+        client.get_customer("Acme")
+
+    assert "test-key" not in str(error.value)
+    assert "test-secret" not in str(error.value)
