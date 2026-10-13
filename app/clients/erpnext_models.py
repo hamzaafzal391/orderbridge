@@ -16,4 +16,5 @@ class ERPNextCustomer(BaseModel):
 
     name: str
     customer_type: str | None = None
+    email_id: str | None = None
     credit_limits: list[ERPNextCreditLimit] = Field(default_factory=list)

@@ -215,3 +215,115 @@ def test_close_closes_client_it_created() -> None:
         assert not client.http_client.is_closed
 
     assert client.http_client.is_closed
+
+
+def test_customer_email_is_mapped_and_blank_becomes_none() -> None:
+    with_email = get_customer_with(customer_response({"name": "Acme", "email_id": " a@b.com "}))
+    blank = get_customer_with(customer_response({"name": "Acme", "email_id": "  "}))
+
+    assert with_email.email == "a@b.com"
+    assert blank.email is None
+
+
+def find_customers_with(handler: Handler, email: str = "sam@example.com") -> list[Customer]:
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = ERPNextClient(settings=make_settings(), http_client=http_client)
+        return client.find_customers_by_email(email)
+
+
+def test_find_customers_by_email_sends_filter_and_fetches_full_records() -> None:
+    seen_paths: list[str] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        assert request.headers["Authorization"] == "token test-key:test-secret"
+        if request.url.path == "/api/resource/Customer":
+            assert request.url.params["filters"] == '[["email_id", "=", "sam@example.com"]]'
+            assert request.url.params["fields"] == '["name"]'
+            assert request.url.params["limit_page_length"] == "10"
+            return httpx.Response(200, json={"data": [{"name": "Acme"}]})
+        assert request.url.path == "/api/resource/Customer/Acme"
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "name": "Acme",
+                    "email_id": "sam@example.com",
+                    "credit_limits": [{"company": "X", "credit_limit": 10}],
+                }
+            },
+        )
+
+    customers = find_customers_with(handle_request)
+
+    assert [customer.name for customer in customers] == ["Acme"]
+    assert customers[0].email == "sam@example.com"
+    assert customers[0].credit_limits[0].amount == Decimal(10)
+    assert seen_paths == ["/api/resource/Customer", "/api/resource/Customer/Acme"]
+
+
+def test_find_customers_by_email_returns_empty_list_when_nothing_matches() -> None:
+    assert find_customers_with(customer_response([])) == []
+
+
+def test_find_customers_by_email_returns_every_match_in_order() -> None:
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/resource/Customer":
+            return httpx.Response(200, json={"data": [{"name": "Acme"}, {"name": "Acme 2"}]})
+        return httpx.Response(200, json={"data": {"name": request.url.path.rsplit("/", 1)[1]}})
+
+    customers = find_customers_with(handle_request)
+
+    assert [customer.name for customer in customers] == ["Acme", "Acme 2"]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_error"),
+    [
+        (401, ERPNextAuthenticationError),
+        (429, ERPNextRateLimitError),
+        (503, ERPNextTemporaryError),
+        (400, ERPNextAPIError),
+    ],
+)
+def test_find_customers_by_email_classifies_http_errors(
+    status_code: int, expected_error: type[ERPNextError]
+) -> None:
+    with pytest.raises(ERPNextError) as error:
+        find_customers_with(respond(status_code, json={"message": "secret-detail"}))
+
+    assert type(error.value) is expected_error
+    assert "secret-detail" not in str(error.value)
+    assert "sam@example.com" not in str(error.value)
+
+
+def test_find_customers_by_email_wraps_timeouts() -> None:
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    with pytest.raises(ERPNextTemporaryError):
+        find_customers_with(handle_request)
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        respond(200, content=b"<html>not json</html>"),
+        respond(200, json={"message": "no data key"}),
+        customer_response("not a list"),
+        customer_response([{"no_name": 1}]),
+        customer_response([{"name": 123}]),
+        customer_response(["not an object"]),
+    ],
+    ids=[
+        "invalid-json",
+        "missing-data",
+        "data-not-a-list",
+        "row-missing-name",
+        "name-not-str",
+        "row-not-object",
+    ],
+)
+def test_find_customers_by_email_rejects_malformed_list(handler: Handler) -> None:
+    with pytest.raises(ERPNextResponseError):
+        find_customers_with(handler)

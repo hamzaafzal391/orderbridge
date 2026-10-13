@@ -21,4 +21,5 @@ class Customer(BaseModel):
 
     name: str
     customer_type: str | None = None
+    email: str | None = None
     credit_limits: list[CreditLimit] = Field(default_factory=list)

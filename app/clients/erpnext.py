@@ -1,3 +1,4 @@
+import json
 from typing import Self
 from urllib.parse import quote
 
@@ -18,6 +19,8 @@ from app.config import Settings, get_settings
 from app.models import CreditLimit, Customer
 
 TEMPORARY_STATUS_CODES = {500, 502, 503, 504}
+# More than one match already means "ambiguous"; no need to fetch an unbounded list.
+MAX_EMAIL_MATCHES = 10
 
 
 class ERPNextClient:
@@ -47,12 +50,35 @@ class ERPNextClient:
         encoded_name = quote(customer_name, safe="")
         url = f"{self.base_url}/api/resource/Customer/{encoded_name}"
 
+        response = self._get(url)
+        return self._to_customer(self._parse_customer(response))
+
+    def find_customers_by_email(self, email: str) -> list[Customer]:
+        """Return every ERPNext customer whose email matches (usually 0 or 1).
+
+        ERPNext keeps a customer's email on its primary contact and copies it to the
+        read-only `email_id` field; customers without one cannot be found this way.
+        """
+        response = self._get(
+            f"{self.base_url}/api/resource/Customer",
+            params={
+                "filters": json.dumps([["email_id", "=", email]]),
+                "fields": json.dumps(["name"]),
+                "limit_page_length": MAX_EMAIL_MATCHES,
+            },
+        )
+        # The list view omits child tables such as credit limits, so fetch full records.
+        return [self.get_customer(name) for name in self._parse_name_list(response)]
+
+    def _get(self, url: str, params: dict[str, str | int] | None = None) -> httpx.Response:
+        """Send an authenticated GET and return the response, or raise a classified error."""
         api_key = self.settings.erpnext_api_key.get_secret_value()
         api_secret = self.settings.erpnext_api_secret.get_secret_value()
 
         try:
             response = self.http_client.get(
                 url,
+                params=params,
                 headers={
                     "Authorization": f"token {api_key}:{api_secret}",
                     "Accept": "application/json",
@@ -69,7 +95,17 @@ class ERPNextClient:
             ) from error
 
         self._raise_for_status(response)
-        return self._to_customer(self._parse_customer(response))
+        return response
+
+    @staticmethod
+    def _parse_name_list(response: httpx.Response) -> list[str]:
+        try:
+            names = [row["name"] for row in response.json()["data"]]
+        except (ValueError, KeyError, TypeError) as error:
+            raise ERPNextResponseError("Response body is not the expected shape") from error
+        if not all(isinstance(name, str) for name in names):
+            raise ERPNextResponseError("Response body is not the expected shape")
+        return names
 
     @staticmethod
     def _to_customer(erpnext_customer: ERPNextCustomer) -> Customer:
@@ -77,6 +113,7 @@ class ERPNextClient:
         return Customer(
             name=erpnext_customer.name,
             customer_type=erpnext_customer.customer_type,
+            email=(erpnext_customer.email_id or "").strip() or None,
             credit_limits=[
                 CreditLimit(company=limit.company, amount=limit.credit_limit)
                 for limit in erpnext_customer.credit_limits

@@ -194,3 +194,15 @@ def test_close_closes_client_it_created() -> None:
         assert not client.http_client.is_closed
 
     assert client.http_client.is_closed
+
+
+@pytest.mark.parametrize(
+    ("email", "expected"),
+    [(" sam@example.com ", "sam@example.com"), ("", None), ("   ", None), (None, None)],
+)
+def test_contact_email_is_mapped_and_blank_becomes_none(
+    email: str | None, expected: str | None
+) -> None:
+    customer = get_contact_with(contact_response({"id": "1", "firstName": "Sam", "email": email}))
+
+    assert customer.email == expected
