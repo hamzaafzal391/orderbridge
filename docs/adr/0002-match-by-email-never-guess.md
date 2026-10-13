@@ -28,11 +28,17 @@ attach data to the wrong customer.
 
 ## Consequences
 
-- ERPNext stores a customer's email on its primary contact and copies it into the read-only
-  `email_id` field. Customers without a primary-contact email are invisible to this lookup and
-  report `no_match`. That can cause a false "no match", but never a wrong match.
-- The ERPNext email filter is built from ERPNext's documented API and covered by unit tests with
-  a fake server; it still needs one check against a live ERPNext instance.
+- ERPNext keeps emails on Contact records that link to customers. The lookup searches contacts
+  by email (any email on the contact, case-insensitive), follows each contact's links to
+  customers, and loads each distinct customer once. The "primary contact" flag is not required.
+  Contacts that are not linked to a customer are ignored. A customer with no linked contact
+  carrying the email reports `no_match`: possibly a false "no match", never a wrong match.
+- Correction (2026-10-13): the first version filtered `Customer.email_id`. A live check against
+  ERPNext v16 showed that field stays empty unless the customer's separate "Customer Primary
+  Contact" link is set, so real customers were missed. The lookup was changed to search
+  contacts and verified live.
+- The lookup costs one contact search, one read per matching contact, and one read per distinct
+  customer (each usually one request).
 - Creating missing customers is deliberately out of scope: it needs idempotency and duplicate
   handling designed first.
 - A stored GoHighLevel contact ID on the ERPNext customer would be more robust long term, and

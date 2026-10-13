@@ -20,7 +20,7 @@ from app.models import CreditLimit, Customer
 
 TEMPORARY_STATUS_CODES = {500, 502, 503, 504}
 # More than one match already means "ambiguous"; no need to fetch an unbounded list.
-MAX_EMAIL_MATCHES = 10
+MAX_CONTACT_MATCHES = 10
 
 
 class ERPNextClient:
@@ -54,21 +54,32 @@ class ERPNextClient:
         return self._to_customer(self._parse_customer(response))
 
     def find_customers_by_email(self, email: str) -> list[Customer]:
-        """Return every ERPNext customer whose email matches (usually 0 or 1).
+        """Return every ERPNext customer linked to a contact with this email (usually 0 or 1).
 
-        ERPNext keeps a customer's email on its primary contact and copies it to the
-        read-only `email_id` field; customers without one cannot be found this way.
+        ERPNext keeps emails on Contact records, which link to customers. We search the
+        contacts instead of `Customer.email_id`, because that field is only filled when a
+        customer's separate "primary contact" link is set. Any email on any linked contact
+        counts; contacts that are not linked to a customer are ignored.
         """
-        response = self._get(
-            f"{self.base_url}/api/resource/Customer",
+        contacts_response = self._get(
+            f"{self.base_url}/api/resource/Contact",
             params={
-                "filters": json.dumps([["email_id", "=", email]]),
+                "filters": json.dumps([["Contact Email", "email_id", "=", email]]),
                 "fields": json.dumps(["name"]),
-                "limit_page_length": MAX_EMAIL_MATCHES,
+                "limit_page_length": MAX_CONTACT_MATCHES,
             },
         )
-        # The list view omits child tables such as credit limits, so fetch full records.
-        return [self.get_customer(name) for name in self._parse_name_list(response)]
+
+        customer_names: dict[str, None] = {}  # a dict keeps order and drops duplicates
+        for contact_name in self._parse_name_list(contacts_response):
+            contact_response = self._get(
+                f"{self.base_url}/api/resource/Contact/{quote(contact_name, safe='')}"
+            )
+            for customer_name in self._parse_linked_customer_names(contact_response):
+                customer_names[customer_name] = None
+
+        # The contact does not carry credit limits etc., so load each full customer record.
+        return [self.get_customer(name) for name in customer_names]
 
     def _get(self, url: str, params: dict[str, str | int] | None = None) -> httpx.Response:
         """Send an authenticated GET and return the response, or raise a classified error."""
@@ -102,6 +113,18 @@ class ERPNextClient:
         try:
             names = [row["name"] for row in response.json()["data"]]
         except (ValueError, KeyError, TypeError) as error:
+            raise ERPNextResponseError("Response body is not the expected shape") from error
+        if not all(isinstance(name, str) for name in names):
+            raise ERPNextResponseError("Response body is not the expected shape")
+        return names
+
+    @staticmethod
+    def _parse_linked_customer_names(response: httpx.Response) -> list[str]:
+        """Names of the customers a contact is linked to (other link types are ignored)."""
+        try:
+            links = response.json()["data"].get("links", [])
+            names = [link["link_name"] for link in links if link["link_doctype"] == "Customer"]
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
             raise ERPNextResponseError("Response body is not the expected shape") from error
         if not all(isinstance(name, str) for name in names):
             raise ERPNextResponseError("Response body is not the expected shape")
