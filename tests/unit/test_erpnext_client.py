@@ -225,56 +225,90 @@ def test_customer_email_is_mapped_and_blank_becomes_none() -> None:
     assert blank.email is None
 
 
+def fake_erpnext(contacts: dict[str, list[dict[str, str]]]) -> Handler:
+    """A fake ERPNext. `contacts` maps each matching contact's name to its `links`.
+
+    Every customer named in a link exists and has one credit limit.
+    """
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/resource/Contact":
+            return httpx.Response(200, json={"data": [{"name": name} for name in contacts]})
+        if path.startswith("/api/resource/Contact/"):
+            name = path.removeprefix("/api/resource/Contact/")
+            return httpx.Response(200, json={"data": {"name": name, "links": contacts[name]}})
+        name = path.removeprefix("/api/resource/Customer/")
+        return httpx.Response(
+            200,
+            json={"data": {"name": name, "credit_limits": [{"company": "X", "credit_limit": 10}]}},
+        )
+
+    return handle_request
+
+
+def customer_link(name: str) -> dict[str, str]:
+    return {"link_doctype": "Customer", "link_name": name}
+
+
 def find_customers_with(handler: Handler, email: str = "sam@example.com") -> list[Customer]:
     with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
         client = ERPNextClient(settings=make_settings(), http_client=http_client)
         return client.find_customers_by_email(email)
 
 
-def test_find_customers_by_email_sends_filter_and_fetches_full_records() -> None:
-    seen_paths: list[str] = []
+def test_find_customers_by_email_searches_contacts_then_loads_linked_customers() -> None:
+    requests: list[httpx.Request] = []
+    inner = fake_erpnext({"Jordan Lee-Acme": [customer_link("Acme")]})
 
     def handle_request(request: httpx.Request) -> httpx.Response:
-        seen_paths.append(request.url.path)
-        assert request.headers["Authorization"] == "token test-key:test-secret"
-        if request.url.path == "/api/resource/Customer":
-            assert request.url.params["filters"] == '[["email_id", "=", "sam@example.com"]]'
-            assert request.url.params["fields"] == '["name"]'
-            assert request.url.params["limit_page_length"] == "10"
-            return httpx.Response(200, json={"data": [{"name": "Acme"}]})
-        assert request.url.path == "/api/resource/Customer/Acme"
-        return httpx.Response(
-            200,
-            json={
-                "data": {
-                    "name": "Acme",
-                    "email_id": "sam@example.com",
-                    "credit_limits": [{"company": "X", "credit_limit": 10}],
-                }
-            },
-        )
+        requests.append(request)
+        return inner(request)
 
     customers = find_customers_with(handle_request)
 
     assert [customer.name for customer in customers] == ["Acme"]
-    assert customers[0].email == "sam@example.com"
     assert customers[0].credit_limits[0].amount == Decimal(10)
-    assert seen_paths == ["/api/resource/Customer", "/api/resource/Customer/Acme"]
+    assert [request.url.raw_path.decode().split("?")[0] for request in requests] == [
+        "/api/resource/Contact",
+        "/api/resource/Contact/Jordan%20Lee-Acme",
+        "/api/resource/Customer/Acme",
+    ]
+    contact_search = requests[0].url.params
+    assert contact_search["filters"] == '[["Contact Email", "email_id", "=", "sam@example.com"]]'
+    assert contact_search["fields"] == '["name"]'
+    assert contact_search["limit_page_length"] == "10"
+    assert all(
+        request.headers["Authorization"] == "token test-key:test-secret" for request in requests
+    )
 
 
-def test_find_customers_by_email_returns_empty_list_when_nothing_matches() -> None:
-    assert find_customers_with(customer_response([])) == []
+def test_find_customers_by_email_returns_empty_list_when_no_contact_matches() -> None:
+    assert find_customers_with(fake_erpnext({})) == []
 
 
-def test_find_customers_by_email_returns_every_match_in_order() -> None:
-    def handle_request(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/resource/Customer":
-            return httpx.Response(200, json={"data": [{"name": "Acme"}, {"name": "Acme 2"}]})
-        return httpx.Response(200, json={"data": {"name": request.url.path.rsplit("/", 1)[1]}})
+def test_contacts_not_linked_to_a_customer_are_ignored() -> None:
+    handler = fake_erpnext(
+        {
+            "No links": [],
+            "Supplier contact": [{"link_doctype": "Supplier", "link_name": "Parts Inc"}],
+        }
+    )
 
-    customers = find_customers_with(handle_request)
+    assert find_customers_with(handler) == []
 
-    assert [customer.name for customer in customers] == ["Acme", "Acme 2"]
+
+def test_each_linked_customer_is_returned_once_in_order() -> None:
+    handler = fake_erpnext(
+        {
+            "Contact A": [customer_link("Acme"), customer_link("Beta")],
+            "Contact B": [customer_link("Acme"), customer_link("Gamma")],
+        }
+    )
+
+    customers = find_customers_with(handler)
+
+    assert [customer.name for customer in customers] == ["Acme", "Beta", "Gamma"]
 
 
 @pytest.mark.parametrize(
@@ -286,11 +320,24 @@ def test_find_customers_by_email_returns_every_match_in_order() -> None:
         (400, ERPNextAPIError),
     ],
 )
+@pytest.mark.parametrize("failing_step", ["contact-search", "contact-read", "customer-read"])
 def test_find_customers_by_email_classifies_http_errors(
-    status_code: int, expected_error: type[ERPNextError]
+    failing_step: str, status_code: int, expected_error: type[ERPNextError]
 ) -> None:
+    inner = fake_erpnext({"Contact A": [customer_link("Acme")]})
+    failing_path = {
+        "contact-search": "/api/resource/Contact",
+        "contact-read": "/api/resource/Contact/Contact%20A",
+        "customer-read": "/api/resource/Customer/Acme",
+    }[failing_step]
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.raw_path.decode().split("?")[0] == failing_path:
+            return httpx.Response(status_code, json={"message": "secret-detail"})
+        return inner(request)
+
     with pytest.raises(ERPNextError) as error:
-        find_customers_with(respond(status_code, json={"message": "secret-detail"}))
+        find_customers_with(handle_request)
 
     assert type(error.value) is expected_error
     assert "secret-detail" not in str(error.value)
@@ -324,6 +371,35 @@ def test_find_customers_by_email_wraps_timeouts() -> None:
         "row-not-object",
     ],
 )
-def test_find_customers_by_email_rejects_malformed_list(handler: Handler) -> None:
+def test_find_customers_by_email_rejects_malformed_contact_list(handler: Handler) -> None:
     with pytest.raises(ERPNextResponseError):
         find_customers_with(handler)
+
+
+@pytest.mark.parametrize(
+    "contact_body",
+    [
+        b"<html>not json</html>",
+        b'{"message": "no data key"}',
+        b'{"data": ["not", "an", "object"]}',
+        b'{"data": {"links": "not a list"}}',
+        b'{"data": {"links": [{"link_doctype": "Customer"}]}}',
+        b'{"data": {"links": [{"link_doctype": "Customer", "link_name": 5}]}}',
+    ],
+    ids=[
+        "invalid-json",
+        "missing-data",
+        "data-not-an-object",
+        "links-not-a-list",
+        "link-missing-name",
+        "link-name-not-str",
+    ],
+)
+def test_find_customers_by_email_rejects_malformed_contact_record(contact_body: bytes) -> None:
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/resource/Contact":
+            return httpx.Response(200, json={"data": [{"name": "Contact A"}]})
+        return httpx.Response(200, content=contact_body)
+
+    with pytest.raises(ERPNextResponseError):
+        find_customers_with(handle_request)
