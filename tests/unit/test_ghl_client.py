@@ -15,8 +15,12 @@ from app.clients.ghl_errors import (
 )
 from app.config import Settings
 from app.models import Customer
+from app.retry import RetryPolicy
 
 Handler = Callable[[httpx.Request], httpx.Response]
+
+# Most tests exercise a single attempt; retry behaviour has its own tests below.
+NO_RETRY = RetryPolicy(max_attempts=1)
 
 
 def make_settings() -> Settings:
@@ -32,7 +36,7 @@ def make_settings() -> Settings:
 def get_contact_with(handler: Handler, contact_id: str = "abc123") -> Customer:
     """Run get_contact against a fake GoHighLevel defined by `handler`."""
     with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
-        client = GHLClient(settings=make_settings(), http_client=http_client)
+        client = GHLClient(settings=make_settings(), http_client=http_client, retry_policy=NO_RETRY)
         return client.get_contact(contact_id)
 
 
@@ -206,3 +210,111 @@ def test_contact_email_is_mapped_and_blank_becomes_none(
     customer = get_contact_with(contact_response({"id": "1", "firstName": "Sam", "email": email}))
 
     assert customer.email == expected
+
+
+class Flaky:
+    """A fake server that fails with `failures` in turn (a status code or an exception), then succeeds."""
+
+    def __init__(
+        self, failures: list[int | Exception], ok: Handler, headers: dict[str, str] | None = None
+    ):
+        self.failures = list(failures)
+        self.ok = ok
+        self.headers = headers or {}
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if self.failures:
+            failure = self.failures.pop(0)
+            if isinstance(failure, Exception):
+                raise failure
+            return httpx.Response(failure, headers=self.headers)
+        return self.ok(request)
+
+
+def retrying(handler: Handler, sleeps: list[float], max_attempts: int = 3) -> GHLClient:
+    """A client whose retry waits are recorded instead of slept (the caller closes it)."""
+    policy = RetryPolicy(max_attempts=max_attempts, sleep=sleeps.append, jitter=lambda delay: delay)
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    return GHLClient(settings=make_settings(), http_client=http_client, retry_policy=policy)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [503, 502, 500, 504, 429, httpx.ConnectTimeout("timed out"), httpx.ConnectError("refused")],
+    ids=["503", "502", "500", "504", "429", "timeout", "connection-error"],
+)
+def test_temporary_failure_is_retried_then_succeeds(failure: int | Exception) -> None:
+    server = Flaky([failure], contact_response({"id": "1", "firstName": "Sam"}))
+    sleeps: list[float] = []
+
+    with retrying(server, sleeps) as client:
+        customer = client.get_contact("1")
+
+    assert customer.name == "Sam"
+    assert len(server.requests) == 2
+    assert sleeps == [0.5]
+
+
+def test_retry_after_header_sets_the_wait() -> None:
+    server = Flaky(
+        [429], contact_response({"id": "1", "firstName": "Sam"}), headers={"Retry-After": "2"}
+    )
+    sleeps: list[float] = []
+
+    with retrying(server, sleeps) as client:
+        client.get_contact("1")
+
+    assert sleeps == [2.0]
+
+
+def test_rate_limit_error_carries_retry_after() -> None:
+    server = Flaky([429], respond(200), headers={"Retry-After": "7"})
+
+    with retrying(server, [], max_attempts=1) as client, pytest.raises(GHLRateLimitError) as error:
+        client.get_contact("1")
+
+    assert error.value.retry_after == 7.0
+
+
+def test_persistent_temporary_failure_gives_up_after_max_attempts() -> None:
+    server = Flaky([503, 503, 503, 503], respond(200))
+    sleeps: list[float] = []
+
+    with retrying(server, sleeps) as client, pytest.raises(GHLTemporaryError) as error:
+        client.get_contact("1")
+
+    assert error.value.status_code == 503
+    assert len(server.requests) == 3
+    assert sleeps == [0.5, 1.0]
+
+
+@pytest.mark.parametrize("failure", [401, 403, 404, 400, 422], ids=str)
+def test_permanent_errors_are_not_retried(failure: int) -> None:
+    server = Flaky([failure, failure], contact_response({"id": "1", "firstName": "Sam"}))
+    sleeps: list[float] = []
+
+    with retrying(server, sleeps) as client, pytest.raises(GHLError):
+        client.get_contact("1")
+
+    assert len(server.requests) == 1
+    assert sleeps == []
+
+
+def test_malformed_response_is_not_retried() -> None:
+    server = Flaky([], respond(200, content=b"<html>not json</html>"))
+
+    with retrying(server, []) as client, pytest.raises(GHLResponseError):
+        client.get_contact("1")
+
+    assert len(server.requests) == 1
+
+
+def test_retries_never_leak_the_token_into_the_final_error() -> None:
+    server = Flaky([503, 503, 503], respond(200))
+
+    with retrying(server, []) as client, pytest.raises(GHLTemporaryError) as error:
+        client.get_contact("1")
+
+    assert "test-ghl-token" not in str(error.value)
