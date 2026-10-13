@@ -26,6 +26,7 @@ def make_settings() -> Settings:
         erpnext_base_url="http://erpnext.test",
         erpnext_api_key="test-key",
         erpnext_api_secret="test-secret",
+        ghl_api_token="test-ghl-token",
     )
 
 
