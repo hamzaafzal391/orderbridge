@@ -52,3 +52,17 @@ class ERPNextResponseError(ERPNextError):
 
 class ERPNextAPIError(ERPNextError):
     """Any other unsuccessful response (e.g. 400, 409, 501)."""
+
+
+class ERPNextUnknownOutcomeError(ERPNextError):
+    """A write failed at the network level; ERPNext may or may not have applied it.
+
+    Never retried automatically: repeating a write whose outcome is unknown could duplicate it.
+    """
+
+
+class ERPNextPartialWriteError(ERPNextError):
+    """A multi-step write stopped halfway (e.g. customer created, its contact was not).
+
+    Never retried automatically; a person or a later repair step must finish it.
+    """

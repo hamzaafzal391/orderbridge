@@ -10,9 +10,11 @@ from app.clients.erpnext_errors import (
     ERPNextAuthenticationError,
     ERPNextError,
     ERPNextNotFoundError,
+    ERPNextPartialWriteError,
     ERPNextRateLimitError,
     ERPNextResponseError,
     ERPNextTemporaryError,
+    ERPNextUnknownOutcomeError,
 )
 from app.clients.erpnext_models import ERPNextCustomer
 from app.config import Settings, get_settings
@@ -90,18 +92,8 @@ class ERPNextClient:
 
     def _get_once(self, url: str, params: dict[str, str | int] | None) -> httpx.Response:
         """One attempt: return the response, or raise a classified error."""
-        api_key = self.settings.erpnext_api_key.get_secret_value()
-        api_secret = self.settings.erpnext_api_secret.get_secret_value()
-
         try:
-            response = self.http_client.get(
-                url,
-                params=params,
-                headers={
-                    "Authorization": f"token {api_key}:{api_secret}",
-                    "Accept": "application/json",
-                },
-            )
+            response = self.http_client.get(url, params=params, headers=self._auth_headers())
         except httpx.TransportError as error:
             # Timeouts, connection failures and protocol errors: worth retrying later.
             raise ERPNextTemporaryError(
@@ -114,6 +106,80 @@ class ERPNextClient:
 
         self._raise_for_status(response)
         return response
+
+    def create_customer(self, customer: Customer) -> Customer | None:
+        """Create the customer in ERPNext and, if it has an email, a linked contact.
+
+        Returns the created customer, or None when ERPNext already has a customer with that
+        name (a customer's ID is its name, so duplicates are rejected). Nothing is changed in
+        that case. Writes are never retried; see ADR 0004.
+
+        Raises ERPNextPartialWriteError if the customer was created but its contact was not.
+        """
+        customer_response = self._post(
+            f"{self.base_url}/api/resource/Customer",
+            {
+                "customer_name": customer.name,
+                "customer_type": customer.customer_type or "Individual",
+                "customer_group": self.settings.erpnext_default_customer_group,
+                "territory": self.settings.erpnext_default_territory,
+            },
+        )
+        if customer_response.status_code >= 400 and self._is_duplicate(customer_response):
+            return None
+        self._raise_for_status(customer_response)
+        created = self._to_customer(self._parse_customer(customer_response))
+
+        if not customer.email:
+            return created
+
+        # The email lives on a Contact linked to the customer; this is what makes the new
+        # customer findable by email (see find_customers_by_email).
+        try:
+            self._raise_for_status(
+                self._post(
+                    f"{self.base_url}/api/resource/Contact",
+                    {
+                        "first_name": customer.name,
+                        "email_ids": [{"email_id": customer.email, "is_primary": 1}],
+                        "links": [{"link_doctype": "Customer", "link_name": created.name}],
+                    },
+                )
+            )
+        except ERPNextError as error:
+            raise ERPNextPartialWriteError(
+                "Customer was created but its contact was not"
+            ) from error
+
+        return created.model_copy(update={"email": customer.email})
+
+    def _post(self, url: str, payload: dict[str, object]) -> httpx.Response:
+        """Send an authenticated POST exactly once. The caller checks the status.
+
+        Deliberately not wrapped in call_with_retries: repeating a write could duplicate it.
+        """
+        try:
+            return self.http_client.post(url, json=payload, headers=self._auth_headers())
+        except httpx.RequestError as error:
+            raise ERPNextUnknownOutcomeError(
+                f"ERPNext write may or may not have been applied ({type(error).__name__})"
+            ) from error
+
+    def _auth_headers(self) -> dict[str, str]:
+        api_key = self.settings.erpnext_api_key.get_secret_value()
+        api_secret = self.settings.erpnext_api_secret.get_secret_value()
+        return {"Authorization": f"token {api_key}:{api_secret}", "Accept": "application/json"}
+
+    @staticmethod
+    def _is_duplicate(response: httpx.Response) -> bool:
+        """Did ERPNext reject the request because the record already exists?"""
+        if response.status_code == 409:
+            return True
+        try:
+            exception = response.json().get("exception", "")
+        except ValueError, AttributeError:
+            return False
+        return isinstance(exception, str) and "DuplicateEntryError" in exception
 
     @staticmethod
     def _parse_name_list(response: httpx.Response) -> list[str]:
