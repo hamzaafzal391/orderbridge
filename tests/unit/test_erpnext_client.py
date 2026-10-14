@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable
 from decimal import Decimal
 
@@ -11,9 +12,11 @@ from app.clients.erpnext_errors import (
     ERPNextAuthenticationError,
     ERPNextError,
     ERPNextNotFoundError,
+    ERPNextPartialWriteError,
     ERPNextRateLimitError,
     ERPNextResponseError,
     ERPNextTemporaryError,
+    ERPNextUnknownOutcomeError,
 )
 from app.config import Settings
 from app.models import Customer
@@ -545,3 +548,246 @@ def test_retries_never_leak_secrets_into_the_final_error() -> None:
 
     assert "test-key" not in str(error.value)
     assert "test-secret" not in str(error.value)
+
+
+# --- create_customer (the first write) ---------------------------------------------------
+
+
+def new_customer(
+    email: str | None = "sam@example.com", customer_type: str | None = "Individual"
+) -> Customer:
+    return Customer(name="Sam Rivera", customer_type=customer_type, email=email)
+
+
+class RecordingServer:
+    """A fake ERPNext for writes. Each POST answers with `customer_reply` / `contact_reply`.
+
+    A reply is a status code, a ready response, or an exception to raise.
+    """
+
+    def __init__(
+        self,
+        customer_reply: int | httpx.Response | Exception = 200,
+        contact_reply: int | httpx.Response | Exception = 200,
+    ) -> None:
+        self.customer_reply = customer_reply
+        self.contact_reply = contact_reply
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        is_customer = request.url.path == "/api/resource/Customer"
+        reply = self.customer_reply if is_customer else self.contact_reply
+        if isinstance(reply, Exception):
+            raise reply
+        if isinstance(reply, httpx.Response):
+            return reply
+        if reply == 200 and is_customer:
+            body = json.loads(request.content)
+            return httpx.Response(200, json={"data": {"name": body["customer_name"], **body}})
+        return httpx.Response(reply, json={"data": {}, "message": "secret-detail"})
+
+    @property
+    def paths(self) -> list[str]:
+        return [request.url.path for request in self.requests]
+
+
+def create_with(
+    server: RecordingServer,
+    customer: Customer | None = None,
+    settings: Settings | None = None,
+    sleeps: list[float] | None = None,
+) -> tuple[Customer | None, list[float]]:
+    """Run create_customer with retries ENABLED, to prove writes never use them."""
+    sleeps = [] if sleeps is None else sleeps
+    policy = RetryPolicy(max_attempts=3, sleep=sleeps.append, jitter=lambda delay: delay)
+    with httpx.Client(transport=httpx.MockTransport(server)) as http_client:
+        client = ERPNextClient(
+            settings=settings or make_settings(), http_client=http_client, retry_policy=policy
+        )
+        return client.create_customer(customer or new_customer()), sleeps
+
+
+def test_create_customer_posts_customer_then_linked_contact() -> None:
+    server = RecordingServer()
+
+    created, sleeps = create_with(server)
+
+    assert [request.method for request in server.requests] == ["POST", "POST"]
+    assert server.paths == ["/api/resource/Customer", "/api/resource/Contact"]
+    assert all(
+        request.headers["Authorization"] == "token test-key:test-secret"
+        for request in server.requests
+    )
+    assert json.loads(server.requests[0].content) == {
+        "customer_name": "Sam Rivera",
+        "customer_type": "Individual",
+        "customer_group": "Commercial",
+        "territory": "Rest Of The World",
+    }
+    assert json.loads(server.requests[1].content) == {
+        "first_name": "Sam Rivera",
+        "email_ids": [{"email_id": "sam@example.com", "is_primary": 1}],
+        "links": [{"link_doctype": "Customer", "link_name": "Sam Rivera"}],
+    }
+    assert created is not None
+    assert created.name == "Sam Rivera"
+    assert created.email == "sam@example.com"
+    assert sleeps == []
+
+
+def test_create_customer_uses_configured_group_and_territory() -> None:
+    settings = Settings(
+        erpnext_base_url="http://erpnext.test",
+        erpnext_api_key="test-key",
+        erpnext_api_secret="test-secret",
+        ghl_api_token="test-ghl-token",
+        erpnext_default_customer_group="Government",
+        erpnext_default_territory="United States",
+    )
+    server = RecordingServer()
+
+    create_with(server, settings=settings)
+
+    body = json.loads(server.requests[0].content)
+    assert (body["customer_group"], body["territory"]) == ("Government", "United States")
+
+
+def test_create_customer_without_a_type_defaults_to_individual() -> None:
+    server = RecordingServer()
+
+    create_with(server, new_customer(customer_type=None))
+
+    assert json.loads(server.requests[0].content)["customer_type"] == "Individual"
+
+
+def test_create_customer_without_email_creates_no_contact() -> None:
+    server = RecordingServer()
+
+    created, _ = create_with(server, new_customer(email=None))
+
+    assert server.paths == ["/api/resource/Customer"]
+    assert created is not None
+    assert created.email is None
+
+
+@pytest.mark.parametrize(
+    "duplicate_reply",
+    [
+        httpx.Response(409, json={"exception": "frappe.exceptions.DuplicateEntryError"}),
+        httpx.Response(409, content=b"conflict"),
+        httpx.Response(
+            417, json={"exception": "frappe.exceptions.DuplicateEntryError: Customer Sam Rivera"}
+        ),
+    ],
+    ids=["409-with-body", "409-without-json", "417-duplicate-entry"],
+)
+def test_duplicate_name_returns_none_and_changes_nothing_else(
+    duplicate_reply: httpx.Response,
+) -> None:
+    server = RecordingServer(customer_reply=duplicate_reply)
+
+    created, sleeps = create_with(server)
+
+    assert created is None
+    assert server.paths == ["/api/resource/Customer"]  # no contact is created
+    assert sleeps == []
+
+
+def test_other_417_validation_error_is_not_mistaken_for_a_duplicate() -> None:
+    reply = httpx.Response(417, json={"exception": "frappe.exceptions.ValidationError: bad"})
+
+    with pytest.raises(ERPNextAPIError):
+        create_with(RecordingServer(customer_reply=reply))
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_error"),
+    [
+        (401, ERPNextAuthenticationError),
+        (403, ERPNextAuthenticationError),
+        (429, ERPNextRateLimitError),
+        (500, ERPNextTemporaryError),
+        (503, ERPNextTemporaryError),
+        (400, ERPNextAPIError),
+    ],
+)
+def test_customer_post_errors_are_classified_and_never_retried(
+    status_code: int, expected_error: type[ERPNextError]
+) -> None:
+    server = RecordingServer(customer_reply=status_code)
+    sleeps: list[float] = []
+
+    with pytest.raises(ERPNextError) as error:
+        create_with(server, sleeps=sleeps)
+
+    assert type(error.value) is expected_error
+    assert sleeps == []  # never waited, because never retried
+    assert server.paths == ["/api/resource/Customer"]  # exactly one attempt, no contact
+    assert "secret-detail" not in str(error.value)
+    assert "Sam Rivera" not in str(error.value)
+    assert "sam@example.com" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "network_error",
+    [
+        httpx.ConnectTimeout("timed out"),
+        httpx.ReadTimeout("timed out"),
+        httpx.ConnectError("refused"),
+    ],
+    ids=["connect-timeout", "read-timeout", "connection-error"],
+)
+def test_network_failure_on_a_write_is_unknown_outcome_and_never_retried(
+    network_error: httpx.TransportError,
+) -> None:
+    server = RecordingServer(customer_reply=network_error)
+
+    with pytest.raises(ERPNextUnknownOutcomeError) as error:
+        create_with(server)
+
+    assert len(server.requests) == 1
+    assert error.value.__cause__ is network_error
+    assert not error.value.retryable
+    assert "Sam Rivera" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "contact_reply",
+    [400, 401, 429, 503, httpx.ReadTimeout("timed out"), httpx.ConnectError("refused")],
+    ids=["400", "401", "429", "503", "timeout", "connection-error"],
+)
+def test_contact_failure_after_customer_created_is_a_partial_write(
+    contact_reply: int | Exception,
+) -> None:
+    server = RecordingServer(contact_reply=contact_reply)
+
+    with pytest.raises(ERPNextPartialWriteError) as error:
+        create_with(server)
+
+    assert server.paths == ["/api/resource/Customer", "/api/resource/Contact"]  # each once
+    assert isinstance(error.value.__cause__, ERPNextError)
+    assert not error.value.retryable
+    assert "Sam Rivera" not in str(error.value)
+    assert "sam@example.com" not in str(error.value)
+    assert "secret-detail" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        httpx.Response(200, content=b"<html>not json</html>"),
+        httpx.Response(200, json={"message": "no data key"}),
+        httpx.Response(200, json={"data": {"customer_type": "Company"}}),
+    ],
+    ids=["invalid-json", "missing-data", "missing-name"],
+)
+def test_malformed_customer_reply_raises_response_error_and_creates_no_contact(
+    reply: httpx.Response,
+) -> None:
+    server = RecordingServer(customer_reply=reply)
+
+    with pytest.raises(ERPNextResponseError):
+        create_with(server)
+
+    assert server.paths == ["/api/resource/Customer"]

@@ -8,6 +8,9 @@ class Settings(BaseSettings):
     erpnext_base_url: HttpUrl
     erpnext_api_key: SecretStr
     erpnext_api_secret: SecretStr
+    # Required by ERPNext on every new customer; the Selling Settings have no defaults.
+    erpnext_default_customer_group: str = "Commercial"
+    erpnext_default_territory: str = "Rest Of The World"
 
     ghl_api_token: SecretStr
     ghl_base_url: HttpUrl = HttpUrl("https://services.leadconnectorhq.com")
