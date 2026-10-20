@@ -66,3 +66,11 @@ class ERPNextPartialWriteError(ERPNextError):
 
     Never retried automatically; a person or a later repair step must finish it.
     """
+
+
+class ERPNextDuplicateCreatedError(ERPNextError):
+    """ERPNext created a customer under a numbered name (e.g. "Acme - 1") because the name existed.
+
+    Happens only if another run created the same name between our check and our write.
+    Never retried; a person must delete the numbered duplicate.
+    """

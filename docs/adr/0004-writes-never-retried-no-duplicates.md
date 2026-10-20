@@ -14,11 +14,14 @@ to remember what has already been done, so full idempotency keys have to wait.
 
 - `sync_contact` writes only when matching returns `no_match`, and at most once. `matched`,
   `no_email` and `ambiguous` never write. `dry_run=True` never writes at all.
-- ERPNext names a customer by its name, so a second customer with the same name is rejected
-  (HTTP 409, or a `DuplicateEntryError` in the reply). `create_customer` turns that into
-  "name already taken" and the service reports `name_conflict`: nothing is changed and a person
-  decides. We never attach a contact to an existing same-named customer, because it could be a
-  different business.
+- Before creating, `create_customer` looks for a customer with the same name (a read). If one
+  exists it returns "name already taken" and the service reports `name_conflict`: nothing is
+  changed and a person decides. We never attach a contact to an existing same-named customer,
+  because it could be a different business.
+- After creating, it checks that the name came back unchanged. If not, `ERPNextDuplicateCreatedError`
+  is raised and no contact is linked to the duplicate.
+- A duplicate-rejection reply (HTTP 409 or `DuplicateEntryError`) is still treated as "name
+  already taken" in case a different ERPNext setup ever sends one.
 - Writes use a single-attempt `_post` that is never wrapped in the retry helper (ADR 0003).
 - A network failure on a write raises `ERPNextUnknownOutcomeError` (not retryable): the write
   may or may not have happened.
@@ -38,5 +41,17 @@ to remember what has already been done, so full idempotency keys have to wait.
   need the database and audit history planned later.
 - Two runs at the same moment cannot both create the customer: ERPNext's unique name decides,
   and the loser gets `name_conflict`.
-- Open question to confirm on the first real write: that this ERPNext answers a duplicate name
-  with 409 or `DuplicateEntryError`. The code accepts either.
+- Check-then-create is not atomic: two runs at the same moment can both pass the name check.
+  The post-check detects the resulting numbered duplicate afterwards; preventing it needs the
+  database or a lock (planned).
+
+## Correction (2026-10-20)
+
+The first version assumed ERPNext rejects a second customer with an existing name, and the unit
+tests used a fake server that did so. The first live write showed otherwise: ERPNext silently
+creates "Name - 1" and answers success. A rerun after a half-finished write would therefore have
+created a numbered duplicate, which is exactly what this ADR set out to prevent. The name check
+and the post-check above were added, and the test fake now mimics the real behaviour. The fix was
+verified live: creating an existing name returned "name already taken" and created nothing.
+Lesson: a fake server is only as good as the behaviour it copies, so important assumptions need a
+live check.
