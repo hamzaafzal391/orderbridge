@@ -60,7 +60,8 @@ Business logic never talks to a vendor API directly. Vendor-specific code lives 
   field names, never response bodies, credentials or values.
 - **Tests never touch live services.** HTTP is faked with `httpx.MockTransport`.
 
-Design decisions are recorded in [`docs/adr/`](docs/adr/).
+Design decisions are recorded in [`docs/adr/`](docs/adr/). The ideas behind them are explained in
+plain language in [`docs/concepts/`](docs/concepts/).
 
 ## Quickstart
 
@@ -76,8 +77,8 @@ pytest -q
 ruff check . && ruff format --check .
 ```
 
-To use the ERPNext client against a real instance, copy `.env.example` to `.env` and fill in
-`ERPNEXT_BASE_URL`, `ERPNEXT_API_KEY` and `ERPNEXT_API_SECRET`. `.env` is git-ignored.
+To run against real instances, copy `.env.example` to `.env` and fill in `ERPNEXT_BASE_URL`,
+`ERPNEXT_API_KEY`, `ERPNEXT_API_SECRET` and `GHL_API_TOKEN`. `.env` is git-ignored.
 
 ```python
 from app.clients.erpnext import ERPNextClient
@@ -91,10 +92,31 @@ with ERPNextClient() as client:
         print("No such customer")
 ```
 
+### Command line
+
+```bash
+python -m app sync <contact_id>            # dry run (default): nothing is written
+python -m app sync <contact_id> --apply    # really create the missing ERPNext customer
+```
+
+It matches a GoHighLevel contact to an ERPNext customer by email and prints one plain-English
+result line, for example `already_matched: matches ERPNext customer "NorthStar Mechanical LLC"`.
+Other results: `would_create`, `created`, `no_email`, `ambiguous`, `name_conflict`. Customer
+names may be shown; emails, tokens and credentials never are.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | matched, created, or would be created |
+| 1 | needs a person: no email, ambiguous, or name conflict |
+| 2 | bad usage |
+| 3 | configuration problem or service error |
+
 ## Project layout
 
 ```
 app/
+├── __main__.py             # makes `python -m app` work
+├── cli.py                  # command line: `sync <contact_id> [--apply]`
 ├── config.py               # settings loaded from environment / .env
 ├── models.py               # OrderBridge's own vendor-independent models (Customer)
 ├── retry.py                # bounded retries with backoff (reads only)
