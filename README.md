@@ -41,7 +41,7 @@ Business logic never talks to a vendor API directly. Vendor-specific code lives 
 | Internal `Customer` model, independent of any vendor | Done |
 | GoHighLevel contact client (read-only), mapped to `Customer` | Done |
 | Read-only matching of a CRM contact to an ERP customer by email | Done |
-| Create the missing ERPNext customer (never retried, never duplicated; dry-run mode) | Done, not yet tried against a real write |
+| Create the missing ERPNext customer (never retried, checks for an existing name first; dry-run mode) | Done, verified against a live ERPNext |
 | Retries with backoff for safe reads (temporary and rate-limit errors) | Done |
 | Stored idempotency keys, duplicate-event handling and automatic repair of half-finished writes | Planned |
 | API (FastAPI), PostgreSQL storage, structured logs, replay and reconciliation | Planned |

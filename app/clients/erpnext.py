@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from app.clients.erpnext_errors import (
     ERPNextAPIError,
     ERPNextAuthenticationError,
+    ERPNextDuplicateCreatedError,
     ERPNextError,
     ERPNextNotFoundError,
     ERPNextPartialWriteError,
@@ -110,12 +111,26 @@ class ERPNextClient:
     def create_customer(self, customer: Customer) -> Customer | None:
         """Create the customer in ERPNext and, if it has an email, a linked contact.
 
-        Returns the created customer, or None when ERPNext already has a customer with that
-        name (a customer's ID is its name, so duplicates are rejected). Nothing is changed in
-        that case. Writes are never retried; see ADR 0004.
+        Returns the created customer, or None when a customer with that name already exists;
+        nothing is changed in that case. Writes are never retried; see ADR 0004.
 
-        Raises ERPNextPartialWriteError if the customer was created but its contact was not.
+        ERPNext does NOT reject a duplicate name: it silently creates "Name - 1". So we look
+        first (a read), and check afterwards that the name came back unchanged.
+
+        Raises ERPNextPartialWriteError if the customer was created but its contact was not,
+        and ERPNextDuplicateCreatedError if ERPNext numbered the new customer (a race).
         """
+        existing = self._get(
+            f"{self.base_url}/api/resource/Customer",
+            params={
+                "filters": json.dumps([["customer_name", "=", customer.name]]),
+                "fields": json.dumps(["name"]),
+                "limit_page_length": 1,
+            },
+        )
+        if self._parse_name_list(existing):
+            return None
+
         customer_response = self._post(
             f"{self.base_url}/api/resource/Customer",
             {
@@ -129,6 +144,13 @@ class ERPNextClient:
             return None
         self._raise_for_status(customer_response)
         created = self._to_customer(self._parse_customer(customer_response))
+
+        if created.name != customer.name:
+            # Someone else created the same name between our check and our write, so ERPNext
+            # numbered ours. Do not link a contact to the duplicate; a person must remove it.
+            raise ERPNextDuplicateCreatedError(
+                "ERPNext created a numbered duplicate customer; it needs to be removed"
+            )
 
         if not customer.email:
             return created

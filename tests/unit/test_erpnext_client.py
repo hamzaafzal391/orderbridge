@@ -10,6 +10,7 @@ from app.clients.erpnext import ERPNextClient
 from app.clients.erpnext_errors import (
     ERPNextAPIError,
     ERPNextAuthenticationError,
+    ERPNextDuplicateCreatedError,
     ERPNextError,
     ERPNextNotFoundError,
     ERPNextPartialWriteError,
@@ -551,6 +552,9 @@ def test_retries_never_leak_secrets_into_the_final_error() -> None:
 
 
 # --- create_customer (the first write) ---------------------------------------------------
+#
+# The fake server below mimics what a live ERPNext was observed to do: it does NOT reject a
+# second customer with an existing name, it silently creates "Name - 1" instead.
 
 
 def new_customer(
@@ -559,37 +563,77 @@ def new_customer(
     return Customer(name="Sam Rivera", customer_type=customer_type, email=email)
 
 
-class RecordingServer:
-    """A fake ERPNext for writes. Each POST answers with `customer_reply` / `contact_reply`.
+Reply = int | httpx.Response | Exception
 
-    A reply is a status code, a ready response, or an exception to raise.
+
+class RecordingServer:
+    """A fake ERPNext for create_customer.
+
+    - `existing_names`: customers already in ERPNext (what the name check finds).
+    - `number_duplicates`: when a POSTed name already exists, ERPNext answers 200 with
+      "Name - 1" (the real behaviour). `race=True` makes the name check miss it, as if another
+      run created the customer between our check and our write.
+    - `*_reply` override the answer to the name check, customer POST or contact POST with a
+      status code, a ready response, or an exception to raise.
     """
 
     def __init__(
         self,
-        customer_reply: int | httpx.Response | Exception = 200,
-        contact_reply: int | httpx.Response | Exception = 200,
+        existing_names: list[str] | None = None,
+        race: bool = False,
+        check_reply: Reply | None = None,
+        customer_reply: Reply | None = None,
+        contact_reply: Reply | None = None,
     ) -> None:
+        self.existing_names = list(existing_names or [])
+        self.race = race
+        self.check_reply = check_reply
         self.customer_reply = customer_reply
         self.contact_reply = contact_reply
         self.requests: list[httpx.Request] = []
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        is_customer = request.url.path == "/api/resource/Customer"
-        reply = self.customer_reply if is_customer else self.contact_reply
+    @staticmethod
+    def _answer(reply: Reply) -> httpx.Response:
         if isinstance(reply, Exception):
             raise reply
         if isinstance(reply, httpx.Response):
             return reply
-        if reply == 200 and is_customer:
-            body = json.loads(request.content)
-            return httpx.Response(200, json={"data": {"name": body["customer_name"], **body}})
         return httpx.Response(reply, json={"data": {}, "message": "secret-detail"})
 
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        path = request.url.path
+
+        if request.method == "GET" and path == "/api/resource/Customer":  # the name check
+            if self.check_reply is not None:
+                return self._answer(self.check_reply)
+            names = [] if self.race else self.existing_names
+            return httpx.Response(200, json={"data": [{"name": name} for name in names]})
+
+        if path == "/api/resource/Customer":  # POST customer
+            if self.customer_reply is not None:
+                return self._answer(self.customer_reply)
+            name = json.loads(request.content)["customer_name"]
+            if name in self.existing_names:
+                name = f"{name} - 1"  # ERPNext numbers duplicates instead of rejecting them
+            return httpx.Response(200, json={"data": {"name": name}})
+
+        if self.contact_reply is not None:  # POST contact
+            return self._answer(self.contact_reply)
+        return httpx.Response(200, json={"data": {}})
+
     @property
-    def paths(self) -> list[str]:
-        return [request.url.path for request in self.requests]
+    def calls(self) -> list[str]:
+        """Each request as 'METHOD /path', in order."""
+        return [f"{request.method} {request.url.path}" for request in self.requests]
+
+    def posts(self) -> list[httpx.Request]:
+        return [request for request in self.requests if request.method == "POST"]
+
+
+CHECK = "GET /api/resource/Customer"
+POST_CUSTOMER = "POST /api/resource/Customer"
+POST_CONTACT = "POST /api/resource/Contact"
 
 
 def create_with(
@@ -597,35 +641,42 @@ def create_with(
     customer: Customer | None = None,
     settings: Settings | None = None,
     sleeps: list[float] | None = None,
-) -> tuple[Customer | None, list[float]]:
+    max_attempts: int = 3,
+) -> Customer | None:
     """Run create_customer with retries ENABLED, to prove writes never use them."""
-    sleeps = [] if sleeps is None else sleeps
-    policy = RetryPolicy(max_attempts=3, sleep=sleeps.append, jitter=lambda delay: delay)
+    policy = RetryPolicy(
+        max_attempts=max_attempts,
+        sleep=(sleeps if sleeps is not None else []).append,
+        jitter=lambda delay: delay,
+    )
     with httpx.Client(transport=httpx.MockTransport(server)) as http_client:
         client = ERPNextClient(
             settings=settings or make_settings(), http_client=http_client, retry_policy=policy
         )
-        return client.create_customer(customer or new_customer()), sleeps
+        return client.create_customer(customer or new_customer())
 
 
-def test_create_customer_posts_customer_then_linked_contact() -> None:
+def test_create_customer_checks_the_name_then_posts_customer_then_linked_contact() -> None:
     server = RecordingServer()
 
-    created, sleeps = create_with(server)
+    created = create_with(server)
 
-    assert [request.method for request in server.requests] == ["POST", "POST"]
-    assert server.paths == ["/api/resource/Customer", "/api/resource/Contact"]
+    assert server.calls == [CHECK, POST_CUSTOMER, POST_CONTACT]
     assert all(
         request.headers["Authorization"] == "token test-key:test-secret"
         for request in server.requests
     )
-    assert json.loads(server.requests[0].content) == {
+    check = server.requests[0].url.params
+    assert check["filters"] == '[["customer_name", "=", "Sam Rivera"]]'
+    assert check["fields"] == '["name"]'
+    assert check["limit_page_length"] == "1"
+    assert json.loads(server.requests[1].content) == {
         "customer_name": "Sam Rivera",
         "customer_type": "Individual",
         "customer_group": "Commercial",
         "territory": "Rest Of The World",
     }
-    assert json.loads(server.requests[1].content) == {
+    assert json.loads(server.requests[2].content) == {
         "first_name": "Sam Rivera",
         "email_ids": [{"email_id": "sam@example.com", "is_primary": 1}],
         "links": [{"link_doctype": "Customer", "link_name": "Sam Rivera"}],
@@ -633,7 +684,6 @@ def test_create_customer_posts_customer_then_linked_contact() -> None:
     assert created is not None
     assert created.name == "Sam Rivera"
     assert created.email == "sam@example.com"
-    assert sleeps == []
 
 
 def test_create_customer_uses_configured_group_and_territory() -> None:
@@ -649,7 +699,7 @@ def test_create_customer_uses_configured_group_and_territory() -> None:
 
     create_with(server, settings=settings)
 
-    body = json.loads(server.requests[0].content)
+    body = json.loads(server.posts()[0].content)
     assert (body["customer_group"], body["territory"]) == ("Government", "United States")
 
 
@@ -658,17 +708,26 @@ def test_create_customer_without_a_type_defaults_to_individual() -> None:
 
     create_with(server, new_customer(customer_type=None))
 
-    assert json.loads(server.requests[0].content)["customer_type"] == "Individual"
+    assert json.loads(server.posts()[0].content)["customer_type"] == "Individual"
 
 
 def test_create_customer_without_email_creates_no_contact() -> None:
     server = RecordingServer()
 
-    created, _ = create_with(server, new_customer(email=None))
+    created = create_with(server, new_customer(email=None))
 
-    assert server.paths == ["/api/resource/Customer"]
+    assert server.calls == [CHECK, POST_CUSTOMER]
     assert created is not None
     assert created.email is None
+
+
+def test_existing_name_returns_none_and_writes_nothing() -> None:
+    server = RecordingServer(existing_names=["Sam Rivera"])
+
+    created = create_with(server)
+
+    assert created is None
+    assert server.calls == [CHECK]  # no POST at all: no numbered duplicate, no contact
 
 
 @pytest.mark.parametrize(
@@ -682,16 +741,13 @@ def test_create_customer_without_email_creates_no_contact() -> None:
     ],
     ids=["409-with-body", "409-without-json", "417-duplicate-entry"],
 )
-def test_duplicate_name_returns_none_and_changes_nothing_else(
+def test_a_duplicate_rejection_is_still_handled_if_erpnext_ever_sends_one(
     duplicate_reply: httpx.Response,
 ) -> None:
     server = RecordingServer(customer_reply=duplicate_reply)
 
-    created, sleeps = create_with(server)
-
-    assert created is None
-    assert server.paths == ["/api/resource/Customer"]  # no contact is created
-    assert sleeps == []
+    assert create_with(server) is None
+    assert server.calls == [CHECK, POST_CUSTOMER]  # no contact
 
 
 def test_other_417_validation_error_is_not_mistaken_for_a_duplicate() -> None:
@@ -699,6 +755,80 @@ def test_other_417_validation_error_is_not_mistaken_for_a_duplicate() -> None:
 
     with pytest.raises(ERPNextAPIError):
         create_with(RecordingServer(customer_reply=reply))
+
+
+def test_numbered_customer_from_a_race_raises_and_links_no_contact() -> None:
+    # Another run created "Sam Rivera" between our name check and our write, so ERPNext
+    # answered the POST with "Sam Rivera - 1".
+    server = RecordingServer(existing_names=["Sam Rivera"], race=True)
+
+    with pytest.raises(ERPNextDuplicateCreatedError) as error:
+        create_with(server)
+
+    assert server.calls == [CHECK, POST_CUSTOMER]  # the contact is NOT attached to the duplicate
+    assert not error.value.retryable
+    assert "Sam Rivera" not in str(error.value)
+    assert "sam@example.com" not in str(error.value)
+
+
+def test_name_check_is_a_read_and_is_retried_on_a_temporary_error() -> None:
+    attempts: list[int] = []
+
+    class FlakyCheck(RecordingServer):
+        def __call__(self, request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and not attempts:
+                attempts.append(1)
+                self.requests.append(request)
+                return httpx.Response(503)
+            return super().__call__(request)
+
+    server = FlakyCheck()
+    sleeps: list[float] = []
+
+    created = create_with(server, sleeps=sleeps)
+
+    assert created is not None
+    assert server.calls == [CHECK, CHECK, POST_CUSTOMER, POST_CONTACT]  # only the READ repeated
+    assert sleeps == [0.5]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_error"),
+    [
+        (401, ERPNextAuthenticationError),
+        (403, ERPNextAuthenticationError),
+        (400, ERPNextAPIError),
+    ],
+)
+def test_name_check_permanent_errors_stop_before_any_write(
+    status_code: int, expected_error: type[ERPNextError]
+) -> None:
+    server = RecordingServer(check_reply=status_code)
+
+    with pytest.raises(ERPNextError) as error:
+        create_with(server)
+
+    assert type(error.value) is expected_error
+    assert server.calls == [CHECK]
+    assert "secret-detail" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "check_body",
+    [
+        httpx.Response(200, content=b"<html>not json</html>"),
+        httpx.Response(200, json={"message": "no data key"}),
+        httpx.Response(200, json={"data": [{"no_name": 1}]}),
+    ],
+    ids=["invalid-json", "missing-data", "row-missing-name"],
+)
+def test_malformed_name_check_reply_stops_before_any_write(check_body: httpx.Response) -> None:
+    server = RecordingServer(check_reply=check_body)
+
+    with pytest.raises(ERPNextResponseError):
+        create_with(server)
+
+    assert server.calls == [CHECK]
 
 
 @pytest.mark.parametrize(
@@ -722,8 +852,8 @@ def test_customer_post_errors_are_classified_and_never_retried(
         create_with(server, sleeps=sleeps)
 
     assert type(error.value) is expected_error
-    assert sleeps == []  # never waited, because never retried
-    assert server.paths == ["/api/resource/Customer"]  # exactly one attempt, no contact
+    assert server.calls == [CHECK, POST_CUSTOMER]  # the POST happened exactly once
+    assert sleeps == []  # never waited, because the write is never retried
     assert "secret-detail" not in str(error.value)
     assert "Sam Rivera" not in str(error.value)
     assert "sam@example.com" not in str(error.value)
@@ -742,11 +872,13 @@ def test_network_failure_on_a_write_is_unknown_outcome_and_never_retried(
     network_error: httpx.TransportError,
 ) -> None:
     server = RecordingServer(customer_reply=network_error)
+    sleeps: list[float] = []
 
     with pytest.raises(ERPNextUnknownOutcomeError) as error:
-        create_with(server)
+        create_with(server, sleeps=sleeps)
 
-    assert len(server.requests) == 1
+    assert server.calls == [CHECK, POST_CUSTOMER]
+    assert sleeps == []
     assert error.value.__cause__ is network_error
     assert not error.value.retryable
     assert "Sam Rivera" not in str(error.value)
@@ -765,12 +897,24 @@ def test_contact_failure_after_customer_created_is_a_partial_write(
     with pytest.raises(ERPNextPartialWriteError) as error:
         create_with(server)
 
-    assert server.paths == ["/api/resource/Customer", "/api/resource/Contact"]  # each once
+    assert server.calls == [CHECK, POST_CUSTOMER, POST_CONTACT]  # each write exactly once
     assert isinstance(error.value.__cause__, ERPNextError)
     assert not error.value.retryable
     assert "Sam Rivera" not in str(error.value)
     assert "sam@example.com" not in str(error.value)
     assert "secret-detail" not in str(error.value)
+
+
+def test_rerun_after_a_partial_write_reports_the_existing_name_instead_of_duplicating() -> None:
+    # First run: customer created, contact failed. The customer now exists in ERPNext.
+    first = RecordingServer(contact_reply=503)
+    with pytest.raises(ERPNextPartialWriteError):
+        create_with(first)
+
+    # Rerun: the name check finds it, so nothing is written and no "Sam Rivera - 1" appears.
+    rerun = RecordingServer(existing_names=["Sam Rivera"])
+    assert create_with(rerun) is None
+    assert rerun.calls == [CHECK]
 
 
 @pytest.mark.parametrize(
@@ -790,4 +934,4 @@ def test_malformed_customer_reply_raises_response_error_and_creates_no_contact(
     with pytest.raises(ERPNextResponseError):
         create_with(server)
 
-    assert server.paths == ["/api/resource/Customer"]
+    assert server.calls == [CHECK, POST_CUSTOMER]
