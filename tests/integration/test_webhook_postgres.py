@@ -71,6 +71,7 @@ def app(engine: Engine, erp: SlowFakeERP):
         erpnext_api_secret="test-secret",
         ghl_api_token="test-ghl-token",
         webhook_secret=SECRET,
+        ghl_pipeline_id="pipe1",
     )
     repo = Repository(make_sessionmaker(engine))
     return create_app(settings, repository=repo, clients=clients), repo

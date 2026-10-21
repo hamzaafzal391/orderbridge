@@ -1,8 +1,10 @@
-"""Bounded retries with exponential backoff, for READ requests only.
+"""Bounded retries with exponential backoff, for requests that are safe to repeat.
+
+That means reads, plus the one write that sets a field to a fixed value (ADR 0009).
 
 An error is retried only if it says so: it has `retryable = True`. Vendor clients mark their
-temporary and rate-limit errors that way. Never wrap a write in `call_with_retries` until the
-write is idempotent (safe to repeat).
+temporary and rate-limit errors that way. Never wrap any other write in `call_with_retries`
+until it is idempotent (safe to repeat).
 """
 
 import random

@@ -11,6 +11,16 @@ class ERPNextCreditLimit(BaseModel):
     credit_limit: Decimal
 
 
+class ERPNextBin(BaseModel):
+    """ERPNext's stock row: one item in one warehouse. A missing quantity means none."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    warehouse: str
+    actual_qty: Decimal | None = None
+    reserved_qty: Decimal | None = None
+
+
 class ERPNextCustomer(BaseModel):
     model_config = ConfigDict(extra="ignore")
 

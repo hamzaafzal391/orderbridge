@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 from typing import Self
 from urllib.parse import quote
 
@@ -10,6 +11,7 @@ from app.clients.erpnext_errors import (
     ERPNextAuthenticationError,
     ERPNextDuplicateCreatedError,
     ERPNextError,
+    ERPNextItemNotFoundError,
     ERPNextNotFoundError,
     ERPNextPartialWriteError,
     ERPNextRateLimitError,
@@ -17,14 +19,16 @@ from app.clients.erpnext_errors import (
     ERPNextTemporaryError,
     ERPNextUnknownOutcomeError,
 )
-from app.clients.erpnext_models import ERPNextCustomer
+from app.clients.erpnext_models import ERPNextBin, ERPNextCustomer
 from app.config import Settings, get_settings
-from app.models import CreditLimit, Customer
+from app.models import CreditLimit, Customer, StockLevel
 from app.retry import RetryPolicy, call_with_retries, parse_retry_after
 
 TEMPORARY_STATUS_CODES = {500, 502, 503, 504}
 # More than one match already means "ambiguous"; no need to fetch an unbounded list.
 MAX_CONTACT_MATCHES = 10
+# More warehouses than this for one item is not a situation this integration is built for.
+MAX_STOCK_ROWS = 100
 
 
 class ERPNextClient:
@@ -86,6 +90,46 @@ class ERPNextClient:
 
         # The contact does not carry credit limits etc., so load each full customer record.
         return [self.get_customer(name) for name in customer_names]
+
+    def get_stock(self, sku: str) -> list[StockLevel]:
+        """Stock of one item in every warehouse that holds it, sorted by warehouse name.
+
+        ERPNext keeps one `Bin` row per item and warehouse. Reading only: nothing is changed.
+        An item that exists but has never been stocked gives an empty list; an item that does
+        not exist raises ERPNextItemNotFoundError, so a typo in the CRM is not mistaken for "out of
+        stock".
+        """
+        response = self._get(
+            f"{self.base_url}/api/resource/Bin",
+            params={
+                "filters": json.dumps([["item_code", "=", sku]]),
+                "fields": json.dumps(["warehouse", "actual_qty", "reserved_qty"]),
+                "limit_page_length": MAX_STOCK_ROWS,
+            },
+        )
+        bins = self._parse_bins(response)
+        if not bins:
+            item = self._get(
+                f"{self.base_url}/api/resource/Item",
+                params={
+                    "filters": json.dumps([["name", "=", sku]]),
+                    "fields": json.dumps(["name"]),
+                    "limit_page_length": 1,
+                },
+            )
+            if not self._parse_name_list(item):
+                raise ERPNextItemNotFoundError("Item not found in ERPNext")
+        return sorted(
+            (
+                StockLevel(
+                    warehouse=row.warehouse,
+                    on_hand=row.actual_qty or Decimal(0),
+                    reserved=row.reserved_qty or Decimal(0),
+                )
+                for row in bins
+            ),
+            key=lambda level: level.warehouse,
+        )
 
     def _get(self, url: str, params: dict[str, str | int] | None = None) -> httpx.Response:
         """Send an authenticated GET, retrying temporary failures (reads are safe to repeat)."""
@@ -212,6 +256,23 @@ class ERPNextClient:
         if not all(isinstance(name, str) for name in names):
             raise ERPNextResponseError("Response body is not the expected shape")
         return names
+
+    @staticmethod
+    def _parse_bins(response: httpx.Response) -> list[ERPNextBin]:
+        try:
+            rows = response.json()["data"]
+            if not isinstance(rows, list):
+                raise TypeError
+            return [ERPNextBin.model_validate(row) for row in rows]
+        except ValidationError as error:
+            # Report only where and what failed, never the offending values.
+            problems = ", ".join(
+                f"{'.'.join(str(part) for part in item['loc'])}: {item['type']}"
+                for item in error.errors()
+            )
+            raise ERPNextResponseError(f"Invalid stock row in response ({problems})") from error
+        except (ValueError, KeyError, TypeError) as error:
+            raise ERPNextResponseError("Response body is not the expected shape") from error
 
     @staticmethod
     def _parse_linked_customer_names(response: httpx.Response) -> list[str]:

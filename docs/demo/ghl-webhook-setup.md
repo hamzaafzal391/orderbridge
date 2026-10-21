@@ -15,6 +15,7 @@ In your own `.env` (never committed):
 ```
 DATABASE_URL=postgresql+psycopg://orderbridge:orderbridge@localhost:5436/orderbridge
 WEBHOOK_SECRET=<a long random value>
+GHL_PIPELINE_ID=<the id of the MetroAir Orders pipeline>
 ```
 
 Generate the secret with:
@@ -23,7 +24,8 @@ Generate the secret with:
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-The server refuses to start with a secret shorter than 16 characters.
+The server refuses to start with a secret shorter than 16 characters, or without `GHL_PIPELINE_ID`
+(the one pipeline OrderBridge may act on; deals in any other pipeline are ignored).
 
 ## 2. Start the database and the server
 
@@ -109,7 +111,7 @@ A failed deal can be sent again: trigger the workflow for the same deal, or call
 
 ## The second endpoint: quote requested (availability check)
 
-Planned together with the availability check: `POST /webhooks/ghl/quote-requested`, with the same
+`POST /webhooks/ghl/quote-requested`, with the same
 `X-Webhook-Secret` header and a body that carries only the opportunity id:
 
 ```json
@@ -117,5 +119,9 @@ Planned together with the availability check: `POST /webhooks/ghl/quote-requeste
 ```
 
 It reads the deal, reads the ERP stock and writes the answer onto the deal's `MetroAir Availability`
-field. Unlike "deal won" it is not made one-time-only: stock changes, so each trigger gives a fresh
+field. It answers `200` with `{"status", "message", "written"}`; `503` for a temporary problem.
+The status is `available`, `short`, `incomplete_deal`, `unknown_item` or `wrong_pipeline`.
+Writing needs the Private Integration token to be allowed to edit opportunities (a missing permission
+answers 500 and is recorded in the audit log). Check it first with
+`python -m app availability <opportunity_id>`, a dry run that writes nothing. Unlike "deal won" it is not made one-time-only: stock changes, so each trigger gives a fresh
 answer, and repeating it is harmless. The workflow setup is in [`ghl-hvac-setup.md`](ghl-hvac-setup.md).
