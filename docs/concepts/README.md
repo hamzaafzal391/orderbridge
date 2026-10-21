@@ -7,6 +7,8 @@ own words.
 **How to use them:** read a page, close it, then answer the "Check yourself" question out loud
 or on paper. If you can explain it without looking, you know it.
 
+New to a word? See the [glossary](glossary.md).
+
 ## Reading order
 
 | # | Page | The idea in a few words |

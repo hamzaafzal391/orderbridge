@@ -9,6 +9,25 @@ A cloakroom ticket. Only one person can hold ticket number 42. If two people rus
 the same moment, the attendant hands the ticket to exactly one of them. The ticket (the key) is
 what stops two coats from being handed out.
 
+## What is a key?
+
+A **key** is just a piece of text that names one job, like a label on a box. For a deal that was
+won, the job is "turn deal 1234 into an order", so its key is:
+
+```
+ghl:opportunity-won:1234
+```
+
+That reads as: where it came from (`ghl`), what happened (`opportunity-won`), which deal (`1234`).
+The same deal always gives the same key, and a different deal gives a different key.
+
+The database keeps one row per key and allows each key only once. If GoHighLevel sends the same
+"deal won" message twice (retries and glitches do happen), the second message asks for a key that is
+already taken, so it does nothing. The order is created once.
+
+This is not a password. An **API key** (like `ERPNEXT_API_KEY`) is a secret that proves who is
+calling; this key is only a label for a job.
+
 ## Tiny example
 
 ```python
