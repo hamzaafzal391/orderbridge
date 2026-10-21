@@ -4,18 +4,43 @@
 
 A reliable CRM-to-ERP integration layer: **GoHighLevel (CRM) ↔ OrderBridge ↔ ERPNext (ERP)**.
 
-> **Status: early development.** One piece is built and tested (the ERPNext customer client).
-> The rest is planned; see [Status](#status).
+> **Status: in development.** The customer engine is built, tested and verified against live
+> systems. The order flow (deal won, credit-checked Sales Order, status back to the CRM) is the
+> next milestone; see [Status](#status).
 
 ## The problem
 
-Sales teams work in a CRM, while finance and fulfilment work in an ERP. Copying orders and
-customers between them by hand is slow and error-prone. Naive integrations also fail quietly:
-a timeout creates a duplicate order, a bad response corrupts data, an expired API key goes
-unnoticed.
+Picture an HVAC equipment distributor that sells rooftop units and thermostats to mechanical
+contractors, on credit. Sales works in a CRM; finance and the warehouse work in an ERP.
+
+- When a deal closes, someone re-types the customer and the order into the ERP: slow, error-prone,
+  and a source of duplicate customers.
+- The rep may have promised equipment to a contractor who is already at their credit limit or has
+  overdue invoices. Finance finds out after the promise.
+- Once the order ships or is invoiced, the sales team has to ask "did it ship?", because the ERP
+  knows and the CRM does not.
+
+Naive integrations also fail quietly: a timeout creates a duplicate order, a bad response corrupts
+data, an expired API key goes unnoticed.
 
 OrderBridge sits between the two systems and treats reliability as the main feature:
 validation, error classification, idempotency, retries and audit history.
+
+## The target flow
+
+```
+Deal marked "Won" in GoHighLevel
+  -> make sure the customer exists in ERPNext              [built]
+  -> check the customer's credit limit                     [planned]
+       within the limit : create the Sales Order and write its number back to the CRM
+       over the limit   : save a draft order, flag "credit hold" in the CRM, alert finance
+  -> the warehouse ships, invoices; the invoice is paid or goes overdue in ERPNext
+  -> the CRM opportunity stage updates itself              [planned]
+```
+
+A deal carries one equipment line: SKU, quantity, agreed unit price and delivery warehouse. The
+reasoning is in [ADR 0005](docs/adr/0005-target-scenario-hvac-distributor.md) and the demo script is
+in [`docs/demo/storyboard.md`](docs/demo/storyboard.md).
 
 ## Architecture
 
@@ -43,8 +68,14 @@ Business logic never talks to a vendor API directly. Vendor-specific code lives 
 | Read-only matching of a CRM contact to an ERP customer by email | Done |
 | Create the missing ERPNext customer (never retried, checks for an existing name first; dry-run mode) | Done, verified against a live ERPNext |
 | Retries with backoff for safe reads (temporary and rate-limit errors) | Done |
-| Stored idempotency keys, duplicate-event handling and automatic repair of half-finished writes | Planned |
-| API (FastAPI), PostgreSQL storage, structured logs, replay and reconciliation | Planned |
+| `python -m app sync` command line (dry run by default) | Done |
+| PostgreSQL foundation: idempotency keys, object links, audit log | Planned (next) |
+| FastAPI webhook endpoint for "deal won" | Planned |
+| Deal to ERPNext Sales Order (one equipment line) | Planned |
+| Credit-limit check: draft order and credit hold when over the limit | Planned |
+| Write-back to GoHighLevel (order number, stage) | Planned |
+| ERP to CRM status sync (shipped, invoiced, paid, overdue) | Planned |
+| Reconciliation, replay of failed events, structured logs | Planned |
 | Docker and AWS deployment | Planned |
 
 ## Reliability design
