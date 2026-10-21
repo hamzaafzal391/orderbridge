@@ -106,3 +106,16 @@ A failed deal can be sent again: trigger the workflow for the same deal, or call
 - The secret is the only protection: use HTTPS, keep it out of screenshots and recordings, and
   change it if it leaks.
 - Answers and logs contain no customer data; the audit log stores ids and statuses only.
+
+## The second endpoint: quote requested (availability check)
+
+Planned together with the availability check: `POST /webhooks/ghl/quote-requested`, with the same
+`X-Webhook-Secret` header and a body that carries only the opportunity id:
+
+```json
+{ "opportunity_id": "<the opportunity's ID merge field>" }
+```
+
+It reads the deal, reads the ERP stock and writes the answer onto the deal's `MetroAir Availability`
+field. Unlike "deal won" it is not made one-time-only: stock changes, so each trigger gives a fresh
+answer, and repeating it is harmless. The workflow setup is in [`ghl-hvac-setup.md`](ghl-hvac-setup.md).
