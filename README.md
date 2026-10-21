@@ -71,7 +71,7 @@ Business logic never talks to a vendor API directly. Vendor-specific code lives 
 | `python -m app sync` command line (dry run by default) | Done |
 | PostgreSQL foundation: idempotency keys, object links, audit log (built and tested; not yet used by the sync flow) | Done |
 | FastAPI webhook for "deal won": secret-protected, claims an idempotency key, makes sure the customer exists, records an audit trail (the Sales Order is the next step) | Done |
-| Deal to ERPNext Sales Order (one equipment line) | Planned |
+| Deal to ERPNext draft Sales Order (one equipment line; deal read from the CRM, fenced to one pipeline) | Planned (next) |
 | Credit-limit check: draft order and credit hold when over the limit | Planned |
 | Write-back to GoHighLevel (order number, stage) | Planned |
 | ERP to CRM status sync (shipped, invoiced, paid, overdue) | Planned |

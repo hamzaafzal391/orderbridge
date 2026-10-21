@@ -9,6 +9,8 @@ All names and amounts are fictional demo data.
 ## Before recording
 
 - Delete leftover test records (`OrderBridge Test`, `OrderBridge Test - 1`) from ERPNext.
+- Set up the demo pipeline, fields, contacts and deals in GoHighLevel: see
+  [`ghl-hvac-setup.md`](ghl-hvac-setup.md).
 - Give the two equipment items a visible price in the demo, or show the price coming from the deal.
 - In GoHighLevel, prepare a new contractor contact with an email that ERPNext does not know.
 - Keep the terminal font large; use `.env` values that are not shown on screen.
