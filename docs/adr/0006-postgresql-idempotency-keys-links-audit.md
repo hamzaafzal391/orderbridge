@@ -50,8 +50,9 @@ CI job with a PostgreSQL service container.
 
 ## Consequences
 
-- Once the claim is used in the sync flow (a later step), the race gap documented in ADR 0004 is
-  closed. This step only builds and tests the foundation; nothing calls it yet.
+- Once the claim is used in the sync flow, the race gap documented in ADR 0004 is closed. This step
+  only built and tested the foundation; the webhook ([ADR 0007](0007-webhook-endpoint.md)) is the
+  first thing to use it.
 - A stale timeout that is too short could let a slow job run twice; ten minutes is conservative and
   adjustable in code.
 - New dependencies: `sqlalchemy` (SQL toolkit), `alembic` (schema migrations) and `psycopg`

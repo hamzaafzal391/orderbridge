@@ -13,8 +13,10 @@ import sys
 from contextlib import ExitStack
 from typing import TextIO
 
+import uvicorn
 from pydantic import ValidationError
 
+from app.api import ConfigurationError, create_app
 from app.clients.erpnext import ERPNextClient
 from app.clients.erpnext_errors import (
     ERPNextDuplicateCreatedError,
@@ -53,7 +55,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="really create the missing ERPNext customer (default: dry run, no writes)",
     )
+    serve = commands.add_parser(
+        "serve",
+        help="run the webhook server that receives 'deal won' messages",
+        description="Run the webhook server (needs WEBHOOK_SECRET and DATABASE_URL).",
+    )
+    serve.add_argument(
+        "--host", default="127.0.0.1", help="address to listen on (default: local only)"
+    )
+    serve.add_argument("--port", type=int, default=8000, help="port to listen on (default: 8000)")
     return parser
+
+
+def serve(host: str, port: int, err: TextIO) -> int:
+    """Start the webhook server. Settings problems print field names only."""
+    try:
+        application = create_app()
+    except ConfigurationError as error:
+        print(f"configuration error: {error}", file=err)
+        return EXIT_ERROR
+    except ValidationError as error:
+        fields = sorted({str(item["loc"][0]) for item in error.errors() if item["loc"]})
+        print(f"configuration error: missing or invalid settings: {', '.join(fields)}", file=err)
+        return EXIT_ERROR
+    uvicorn.run(application, host=host, port=port)
+    return EXIT_OK
 
 
 def describe(result: SyncResult) -> str:
@@ -102,6 +128,9 @@ def main(
         args = build_parser().parse_args(argv)
     except SystemExit as exit_:  # argparse exits on bad usage and on --help
         return int(exit_.code or 0)
+
+    if args.command == "serve":
+        return serve(args.host, args.port, err)
 
     dry_run = not args.apply
     if dry_run:

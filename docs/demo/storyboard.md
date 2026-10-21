@@ -34,4 +34,7 @@ before a promise is made."
 ## Notes
 
 - A rough recording of scenes 1 to 4 is possible now. Re-record once scenes 5 to 7 exist.
+- Scene 5 is partly possible: marking a deal Won in GoHighLevel now reaches OrderBridge through the
+  webhook and makes sure the customer exists (see `docs/demo/ghl-webhook-setup.md`). The Sales Order
+  is the next step.
 - Scene 8 needs the database and webhook work; the audit log is the proof it did the right thing.

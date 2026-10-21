@@ -5,51 +5,18 @@ Locally, `docker compose up -d db` provides the database (see docker-compose.yml
 These tests are excluded from the default run, which stays offline.
 """
 
-import os
-import threading
 from collections import Counter
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pytest
-from alembic import command
-from alembic.config import Config
+from helpers import WORKERS, race
 from sqlalchemy import Engine, inspect, text
 
 from app.db.models import Base
 from app.db.repository import Repository
-from app.db.session import make_engine, make_sessionmaker
+from app.db.session import make_sessionmaker
 
 pytestmark = pytest.mark.integration
-
-ROOT = Path(__file__).resolve().parents[2]
-WORKERS = 16
-
-
-@pytest.fixture(scope="module")
-def database_url() -> str:
-    url = os.environ.get("DATABASE_URL_TEST")
-    if not url:
-        pytest.skip("DATABASE_URL_TEST is not set")
-    return url
-
-
-@pytest.fixture(scope="module")
-def engine(database_url: str) -> Iterator[Engine]:
-    """A database built by the real migration, so the migration itself is tested."""
-    config = Config(str(ROOT / "alembic.ini"))
-    config.set_main_option("script_location", str(ROOT / "migrations"))
-    patch = pytest.MonkeyPatch()
-    patch.setenv("DATABASE_URL", database_url)  # read by migrations/env.py
-    try:
-        command.downgrade(config, "base")
-        command.upgrade(config, "head")
-        engine = make_engine(database_url)
-        yield engine
-        engine.dispose()
-    finally:
-        patch.undo()
 
 
 @pytest.fixture
@@ -59,23 +26,6 @@ def repo(engine: Engine) -> Repository:
             text("TRUNCATE audit_log, object_links, idempotency_keys RESTART IDENTITY")
         )
     return Repository(make_sessionmaker(engine))
-
-
-def race(work, workers: int = WORKERS) -> list:
-    """Run `work(index)` in many threads released at the same instant; return all results."""
-    barrier = threading.Barrier(workers)
-    results: list = [None] * workers
-
-    def run(index: int) -> None:
-        barrier.wait()
-        results[index] = work(index)
-
-    threads = [threading.Thread(target=run, args=(index,)) for index in range(workers)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    return results
 
 
 # --- the migration matches the models ------------------------------------------------------
