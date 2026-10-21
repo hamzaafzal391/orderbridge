@@ -29,18 +29,22 @@ validation, error classification, idempotency, retries and audit history.
 ## The target flow
 
 ```
-Deal marked "Won" in GoHighLevel
-  -> make sure the customer exists in ERPNext              [built]
-  -> check the customer's credit limit                     [planned]
-       within the limit : create the Sales Order and write its number back to the CRM
-       over the limit   : save a draft order, flag "credit hold" in the CRM, alert finance
-  -> the warehouse ships, invoices; the invoice is paid or goes overdue in ERPNext
-  -> the CRM opportunity stage updates itself              [planned]
+Deal reaches "Quote sent" in GoHighLevel
+  -> read the stock in ERPNext and write the answer on the deal      [planned, next]
+Deal marked "Won"
+  -> make sure the customer exists in ERPNext                        [built]
+  -> create the draft Sales Order, write its number back             [planned]
+  -> check the customer's credit limit                               [planned]
+       within the limit : submit; ships on credit, invoiced after
+       over the limit   : hold; invoice first; ships after payment
+Shipped, invoiced, paid or overdue in ERPNext
+  -> the deal's stage in the CRM updates itself                      [planned]
 ```
 
 A deal carries one equipment line: SKU, quantity, agreed unit price and delivery warehouse. The
-reasoning is in [ADR 0005](docs/adr/0005-target-scenario-hvac-distributor.md) and the demo script is
-in [`docs/demo/storyboard.md`](docs/demo/storyboard.md).
+lifecycle and build order are in [ADR 0009](docs/adr/0009-sales-lifecycle-and-build-order.md), the
+scenario in [ADR 0005](docs/adr/0005-target-scenario-hvac-distributor.md), and the demo script in
+[`docs/demo/storyboard.md`](docs/demo/storyboard.md).
 
 ## Architecture
 
@@ -71,8 +75,9 @@ Business logic never talks to a vendor API directly. Vendor-specific code lives 
 | `python -m app sync` command line (dry run by default) | Done |
 | PostgreSQL foundation: idempotency keys, object links, audit log (built and tested; not yet used by the sync flow) | Done |
 | FastAPI webhook for "deal won": secret-protected, claims an idempotency key, makes sure the customer exists, records an audit trail (the Sales Order is the next step) | Done |
-| Deal to ERPNext draft Sales Order (one equipment line; deal read from the CRM, fenced to one pipeline) | Planned (next) |
-| Credit-limit check: draft order and credit hold when over the limit | Planned |
+| Availability check: a deal reaching "Quote sent" gets the ERPNext stock answer written on it (read-only on ERPNext) | Planned (next) |
+| Deal won to ERPNext draft Sales Order (one equipment line; deal read from the CRM, fenced to one pipeline) | Planned |
+| Credit check: within the limit ships on credit; over the limit or a new customer is held, invoiced first, shipped after payment | Planned |
 | Write-back to GoHighLevel (order number, stage) | Planned |
 | ERP to CRM status sync (shipped, invoiced, paid, overdue) | Planned |
 | Reconciliation, replay of failed events, structured logs | Planned |

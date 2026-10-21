@@ -28,9 +28,10 @@ Settings, then Custom Fields, then Add Custom Field. For each one choose the obj
 |---|---|---|
 | `MetroAir SKU` | Dropdown (single) | `AC-5TON-RTU`, `THERMOSTAT-WIFI` |
 | `MetroAir Quantity` | Number | |
-| `MetroAir Unit price` | Monetary (or Number) | the agreed price per unit, in USD |
+| `MetroAir Unit Price` | Monetary (or Number) | the agreed price per unit, in USD |
 | `MetroAir Warehouse` | Dropdown (single) | `Dallas Warehouse - MAS`, `Houston Warehouse - MAS` |
-| `MetroAir ERP order number` | Text (single line) | left empty; a later step writes it back |
+| `MetroAir ERP order number` | **Text (single line)**, not Number | left empty; a later step writes `SAL-ORD-...` into it |
+| `MetroAir Availability` | Text (multi-line, if offered) | left empty; OrderBridge writes the stock answer here |
 
 Type the option values exactly as shown: they must match the ERPNext item and warehouse names.
 GoHighLevel generates a key for each field (something like `opportunity.metroair_sku`); I will read
@@ -66,30 +67,43 @@ Do **not** mark any of them Won yet: that is what triggers the workflow.
 What the demo uses them for: NorthStar is within its credit limit, BluePeak is well over its
 $5,000 limit (the credit hold, a later step), and Lone Star is a new customer.
 
-## 5. The workflow (after the code is ready)
+## 5. Let the integration write to deals
 
-Do this step only when I tell you the order code is merged. It is described here so you know what
+OrderBridge writes the stock answer onto the deal, so the Private Integration token needs the
+permission to **edit opportunities**, not only read them. In Settings, then Private Integrations,
+open your integration and add the opportunity write permission (often labelled "Edit Opportunities").
+Keep the read permissions you already have. I will confirm it with one harmless write to a demo deal.
+
+## 6. The two workflows (after the code is ready)
+
+Do this step only when I tell you the matching code is merged. It is described here so you know what
 is coming.
 
+**Workflow A, "quote requested" (the availability check):**
+- **Triggers:** Pipeline Stage Changed to **Quote Sent**, and Opportunity Created, both filtered to
+  the pipeline **`MetroAir Orders`**.
+- **Action:** Webhook to `/webhooks/ghl/quote-requested`. The body carries only the opportunity id.
+
+**Workflow B, "deal won" (the order):**
 - **Trigger:** Opportunity Status Changed, with the filters **Pipeline is `MetroAir Orders`** and
-  **Status is Won**. The pipeline filter is what keeps your real pipelines out of it.
-- **Action:** Webhook, as in [`ghl-webhook-setup.md`](ghl-webhook-setup.md). The body carries only
-  the two ids. OrderBridge reads the deal itself from GoHighLevel, so the message cannot change the
-  SKU, quantity or price.
+  **Status is Won**.
+- **Action:** Webhook to `/webhooks/ghl/deal-won`, as in [`ghl-webhook-setup.md`](ghl-webhook-setup.md).
 
-OrderBridge also checks the pipeline on its own side, so a deal from any other pipeline is refused
-even if the workflow filter were wrong.
+The pipeline filter is what keeps your real pipelines out of both. OrderBridge also checks the
+pipeline on its own side, and it reads the deal itself from GoHighLevel, so a message cannot change
+the SKU, quantity or price.
 
-## 6. Tell me when it is done
+## 7. Tell me when it is done
 
-Reply with "setup done". I will then check, read-only through the API, that the pipeline, the five
+Reply with "setup done". I will then check, read-only through the API, that the pipeline, the six
 fields and the three deals exist, and note their real ids and keys. I will not change anything in
 GoHighLevel.
 
 ## Checklist
 
 - [ ] Pipeline `MetroAir Orders` with 7 stages
-- [ ] 5 opportunity custom fields
+- [ ] 6 opportunity custom fields (order number as Text)
+- [ ] The token can edit opportunities
 - [ ] 3 demo contacts with the emails above
 - [ ] ERPNext contact `Jordan Lee-NorthStar Mechanical LLC` has the demo email
 - [ ] 3 demo deals, all still Open
