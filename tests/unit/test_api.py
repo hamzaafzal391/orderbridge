@@ -23,6 +23,7 @@ SECRET = "a-long-shared-secret-for-tests"
 URL = "/webhooks/ghl/deal-won"
 BODY = {"opportunity_id": "opp-1", "contact_id": "contact-1"}
 KEY = "ghl:opportunity-won:opp-1"
+PIPELINE = "pipe1"
 
 
 class FakeContacts:
@@ -79,6 +80,7 @@ def make_settings(**overrides: object) -> Settings:
         "erpnext_api_secret": "test-secret",
         "ghl_api_token": "test-ghl-token",
         "webhook_secret": SECRET,
+        "ghl_pipeline_id": PIPELINE,
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)  # type: ignore[call-arg, arg-type]

@@ -32,8 +32,8 @@ Fulfilment          Shipped, Invoiced, Paid (or Overdue) move the deal's stage b
 | # | Scene | What to show | Possible today? |
 |---|---|---|---|
 | 1 | The problem (30 s) | Re-typing orders, promising stock that is not there, a credit surprise, "did it ship?" | Yes |
-| 2 | Quote, then availability | Move a deal to Quote sent; the answer appears on the deal: `OK: 6 available in Dallas Warehouse - MAS (need 4)` | Planned (next) |
-| 3 | Not enough stock | A deal that asks for more than is available: `SHORT: ... Houston Warehouse - MAS has 7 available`; the rep switches warehouse | Planned (next) |
+| 2 | Quote, then availability | Move a deal to Quote sent; the answer appears on the deal: `OK: 6 available in Dallas Warehouse - MAS (need 4)` | Yes |
+| 3 | Not enough stock | A deal that asks for more than is available: `SHORT: ... Houston Warehouse - MAS has 7 available`; the rep switches warehouse | Yes |
 | 4 | Won becomes an order | Mark the deal Won; a draft Sales Order appears in ERPNext; its number shows on the deal | Planned |
 | 5 | Within credit: ships on credit | NorthStar ($16,800 against a $50,000 limit): the order is submitted; later it ships, is invoiced and paid | Planned |
 | 6 | Over credit: hold, prepay | BluePeak (the same order against a $5,000 limit): credit hold; invoice first; ships after payment | Planned |

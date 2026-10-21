@@ -1,4 +1,5 @@
 import io
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
@@ -12,7 +13,7 @@ from app.clients.erpnext_errors import (
 )
 from app.clients.ghl_errors import GHLNotFoundError
 from app.config import Settings
-from app.models import Customer
+from app.models import Customer, Deal, StockLevel
 
 DRY_RUN_HEADER = "mode: dry run (nothing will be written; use --apply to write)"
 APPLY_HEADER = "mode: APPLY (will write to ERPNext if needed)"
@@ -352,3 +353,121 @@ def test_serve_prints_field_names_but_never_values_for_invalid_settings(
 def test_serve_rejects_a_port_that_is_not_a_number(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["serve", "--port", "abc"]) == 2
     assert "usage:" in capsys.readouterr().err
+
+
+# --- availability ---------------------------------------------------------------------------
+
+
+class FakeDeals:
+    def __init__(self, deal: Deal | None = None, error: Exception | None = None) -> None:
+        self.deal = deal or Deal(
+            id="opp1",
+            status="open",
+            pipeline_id="pipe1",
+            sku="AC-5TON-RTU",
+            quantity=Decimal(4),
+            warehouse="Dallas Warehouse - MAS",
+        )
+        self.error = error
+        self.written: list[tuple[str, str]] = []
+
+    def get_deal(self, opportunity_id: str) -> Deal:
+        if self.error:
+            raise self.error
+        return self.deal
+
+    def set_availability_note(self, opportunity_id: str, note: str) -> None:
+        self.written.append((opportunity_id, note))
+
+
+class FakeStock:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+
+    def get_stock(self, sku: str) -> list[StockLevel]:
+        if self.error:
+            raise self.error
+        return [
+            StockLevel(warehouse="Dallas Warehouse - MAS", on_hand=Decimal(7), reserved=Decimal(1))
+        ]
+
+
+def run_availability(argv, deals=None, stock=None, pipeline_id="pipe1"):
+    out, err = io.StringIO(), io.StringIO()
+    code = cli.main(
+        ["availability", "opp1", *argv],
+        deals=deals or FakeDeals(),
+        erp=stock or FakeStock(),
+        pipeline_id=pipeline_id,
+        out=out,
+        err=err,
+    )
+    return code, out.getvalue().splitlines(), err.getvalue()
+
+
+def test_availability_is_a_dry_run_by_default() -> None:
+    deals = FakeDeals()
+    code, lines, err = run_availability([], deals)
+
+    assert code == 0
+    assert lines[0] == DRY_RUN_HEADER
+    assert lines[1] == (
+        "available: OK: 6 available in Dallas Warehouse - MAS (need 4) [not written (dry run)]"
+    )
+    assert deals.written == [] and err == ""
+
+
+def test_availability_apply_writes_the_answer() -> None:
+    deals = FakeDeals()
+    code, lines, _ = run_availability(["--apply"], deals)
+
+    assert code == 0
+    assert lines[0] == "mode: APPLY (will write the answer onto the deal)"
+    assert lines[1].endswith("[written onto the deal]")
+    assert deals.written == [("opp1", "OK: 6 available in Dallas Warehouse - MAS (need 4)")]
+
+
+def test_short_stock_is_still_a_normal_answer() -> None:
+    deal = Deal(
+        id="opp1",
+        status="open",
+        pipeline_id="pipe1",
+        sku="X",
+        quantity=Decimal(20),
+        warehouse="Dallas Warehouse - MAS",
+    )
+    code, lines, _ = run_availability([], FakeDeals(deal))
+    assert code == 0
+    assert lines[1].startswith("short: SHORT: 6 available")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "start"),
+    [({"sku": None}, "incomplete_deal:"), ({"pipeline_id": "other"}, "wrong_pipeline:")],
+)
+def test_outcomes_that_need_a_person_exit_1(overrides: dict, start: str) -> None:
+    deal = FakeDeals().deal.model_copy(update=overrides)
+    deals = FakeDeals(deal)
+    code, lines, _ = run_availability(["--apply"], deals)
+
+    assert code == 1
+    assert lines[1].startswith(start)
+    if "pipeline_id" in overrides:
+        assert deals.written == []
+
+
+def test_availability_service_errors_exit_3_without_details() -> None:
+    deals = FakeDeals(error=GHLNotFoundError("GoHighLevel returned HTTP 404"))
+    code, _, err = run_availability([], deals)
+    assert code == 3
+    assert err == "error: GHLNotFoundError: GoHighLevel returned HTTP 404\n"
+
+
+def test_availability_needs_a_configured_pipeline() -> None:
+    code, _, err = run_availability([], pipeline_id="")
+    assert code == 3
+    assert err == "configuration error: missing or invalid settings: ghl_pipeline_id\n"
+
+
+def test_availability_needs_an_opportunity_id() -> None:
+    assert cli.main(["availability"], out=io.StringIO(), err=io.StringIO()) == 2
