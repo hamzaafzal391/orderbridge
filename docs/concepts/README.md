@@ -25,9 +25,10 @@ or on paper. If you can explain it without looking, you know it.
 | 12 | [Fake servers versus live checks](12-fake-servers-vs-live-checks.md) | A test is only as good as its fake |
 | 13 | [CI and branch protection](13-ci-and-branch-protection.md) | A robot checks every change |
 | 14 | [Pull requests and decision records](14-pull-requests-and-adrs.md) | Small changes, written reasons |
+| 15 | [Idempotency keys and the database](15-idempotency-keys-and-the-database.md) | A shared row decides who does the work |
 
-Planned but not built yet (so not covered here as facts): the FastAPI webhook endpoint,
-PostgreSQL audit history and stored idempotency keys, Docker and AWS deployment.
+Planned but not built yet (so not covered here as facts): the FastAPI webhook endpoint, using the
+stored keys inside the sync flow, Docker and AWS deployment.
 
 The project's decision records live in [`../adr/`](../adr/); these notes explain the ideas behind
 them in plainer words.

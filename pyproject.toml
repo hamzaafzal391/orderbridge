@@ -10,6 +10,9 @@ requires-python = ">=3.14,<3.15"
 dependencies = [
     "httpx>=0.28,<1",
     "pydantic-settings>=2.12,<3",
+    "sqlalchemy>=2.0,<3",
+    "alembic>=1.13,<2",
+    "psycopg[binary]>=3.2,<4",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +26,11 @@ include = ["app*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: needs a real PostgreSQL (DATABASE_URL_TEST); excluded from the default run",
+]
+# The default run stays offline. Run the integration tests with: pytest -m integration
+addopts = "-m 'not integration'"
 
 [tool.ruff]
 target-version = "py314"
