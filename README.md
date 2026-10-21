@@ -29,18 +29,22 @@ validation, error classification, idempotency, retries and audit history.
 ## The target flow
 
 ```
-Deal marked "Won" in GoHighLevel
-  -> make sure the customer exists in ERPNext              [built]
-  -> check the customer's credit limit                     [planned]
-       within the limit : create the Sales Order and write its number back to the CRM
-       over the limit   : save a draft order, flag "credit hold" in the CRM, alert finance
-  -> the warehouse ships, invoices; the invoice is paid or goes overdue in ERPNext
-  -> the CRM opportunity stage updates itself              [planned]
+Deal reaches "Quote sent" in GoHighLevel
+  -> read the stock in ERPNext and write the answer on the deal      [built]
+Deal marked "Won"
+  -> make sure the customer exists in ERPNext                        [built]
+  -> create the draft Sales Order, write its number back             [planned]
+  -> check the customer's credit limit                               [planned]
+       within the limit : submit; ships on credit, invoiced after
+       over the limit   : hold; invoice first; ships after payment
+Shipped, invoiced, paid or overdue in ERPNext
+  -> the deal's stage in the CRM updates itself                      [planned]
 ```
 
 A deal carries one equipment line: SKU, quantity, agreed unit price and delivery warehouse. The
-reasoning is in [ADR 0005](docs/adr/0005-target-scenario-hvac-distributor.md) and the demo script is
-in [`docs/demo/storyboard.md`](docs/demo/storyboard.md).
+lifecycle and build order are in [ADR 0009](docs/adr/0009-sales-lifecycle-and-build-order.md), the
+scenario in [ADR 0005](docs/adr/0005-target-scenario-hvac-distributor.md), and the demo script in
+[`docs/demo/storyboard.md`](docs/demo/storyboard.md).
 
 ## Architecture
 
@@ -70,9 +74,10 @@ Business logic never talks to a vendor API directly. Vendor-specific code lives 
 | Retries with backoff for safe reads (temporary and rate-limit errors) | Done |
 | `python -m app sync` command line (dry run by default) | Done |
 | PostgreSQL foundation: idempotency keys, object links, audit log (built and tested; not yet used by the sync flow) | Done |
-| FastAPI webhook endpoint for "deal won" | Planned |
-| Deal to ERPNext Sales Order (one equipment line) | Planned |
-| Credit-limit check: draft order and credit hold when over the limit | Planned |
+| FastAPI webhook for "deal won": secret-protected, claims an idempotency key, makes sure the customer exists, records an audit trail (the Sales Order is the next step) | Done |
+| Availability check: a deal reaching "Quote sent" gets the ERPNext stock answer written on it (read-only on ERPNext; dry run by default) | Done, verified against live GoHighLevel and ERPNext (including the write onto a deal) |
+| Deal won to ERPNext draft Sales Order (one equipment line; deal read from the CRM, fenced to one pipeline) | Planned |
+| Credit check: within the limit ships on credit; over the limit or a new customer is held, invoiced first, shipped after payment | Planned |
 | Write-back to GoHighLevel (order number, stage) | Planned |
 | ERP to CRM status sync (shipped, invoiced, paid, overdue) | Planned |
 | Reconciliation, replay of failed events, structured logs | Planned |
@@ -130,7 +135,18 @@ python -m app sync <contact_id>            # dry run (default): nothing is writt
 python -m app sync <contact_id> --apply    # really create the missing ERPNext customer
 ```
 
-It matches a GoHighLevel contact to an ERPNext customer by email and prints one plain-English
+```bash
+python -m app availability <opportunity_id>           # dry run (default): prints the answer
+python -m app availability <opportunity_id> --apply   # writes the answer onto the deal
+```
+
+`availability` reads a deal, reads the ERPNext stock and prints a sentence such as
+`OK: 6 available in Dallas Warehouse - MAS (need 4)`. ERPNext is only read. It needs
+`GHL_PIPELINE_ID` (the one pipeline OrderBridge may act on) and, with `--apply`, a GoHighLevel
+token that may edit opportunities. Exit code 0 for `available` and `short`, 1 when a person must
+look (`incomplete_deal`, `unknown_item`, `wrong_pipeline`), 3 for configuration or service errors.
+
+`sync` matches a GoHighLevel contact to an ERPNext customer by email and prints one plain-English
 result line, for example `already_matched: matches ERPNext customer "NorthStar Mechanical LLC"`.
 Other results: `would_create`, `created`, `no_email`, `ambiguous`, `name_conflict`. Customer
 names may be shown; emails, tokens and credentials never are.
@@ -141,6 +157,29 @@ names may be shown; emails, tokens and credentials never are.
 | 1 | needs a person: no email, ambiguous, or name conflict |
 | 2 | bad usage |
 | 3 | configuration problem or service error |
+
+### Webhook server
+
+GoHighLevel workflows call OrderBridge when a deal is marked Won (`/webhooks/ghl/deal-won`) or
+reaches "Quote sent" (`/webhooks/ghl/quote-requested`). The server needs the database, a shared
+secret (at least 16 characters) and `GHL_PIPELINE_ID` in your `.env`:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"   # use the output as WEBHOOK_SECRET
+python -m app serve                                           # listens on 127.0.0.1:8000
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/webhooks/ghl/deal-won \
+  -H "X-Webhook-Secret: $WEBHOOK_SECRET" -H "Content-Type: application/json" \
+  -d '{"opportunity_id": "opp-1", "contact_id": "<a GoHighLevel contact ID>"}'
+```
+
+The same won deal sent twice, or at the same instant, is processed once. A quote request is not
+made one-time-only: stock changes, so each request gives a fresh answer and repeating it is harmless. Wrong or missing secret: 401.
+Temporary problem: 503. Setup steps for GoHighLevel are in
+[`docs/demo/ghl-webhook-setup.md`](docs/demo/ghl-webhook-setup.md) (not yet verified against a real
+workflow).
 
 ### Database (optional)
 
@@ -163,14 +202,18 @@ The credentials in `docker-compose.yml` are for that throwaway local container o
 ```
 app/
 ├── __main__.py             # makes `python -m app` work
-├── cli.py                  # command line: `sync <contact_id> [--apply]`
+├── api.py                  # webhook server: deal-won, quote-requested, GET /health
+├── cli.py                  # command line: `sync`, `availability` (both [--apply]), `serve`
 ├── config.py               # settings loaded from environment / .env
-├── models.py               # OrderBridge's own vendor-independent models (Customer)
+├── models.py               # OrderBridge's own vendor-independent models (Customer, Deal, StockLevel)
+├── errors.py               # errors the business logic understands (UnknownItemError)
 ├── db/                     # PostgreSQL: tables, session, repository (claim, links, audit)
-├── retry.py                # bounded retries with backoff (reads only)
+├── retry.py                # bounded retries with backoff (reads, and the one idempotent write)
 ├── services/
+│   ├── availability.py       # business logic: is the deal's stock available?
 │   ├── customer_matching.py  # business logic: match a CRM contact to an ERP customer
-│   └── customer_sync.py      # business logic: create the ERP customer if none exists
+│   ├── customer_sync.py      # business logic: create the ERP customer if none exists
+│   └── deal_won.py           # business logic: handle a won deal exactly once
 └── clients/
     ├── erpnext.py          # ERPNext HTTP client; converts ERPNext data to Customer
     ├── erpnext_errors.py   # ERPNext error hierarchy

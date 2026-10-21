@@ -1,9 +1,11 @@
 import io
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
 
 from app import cli
+from app.api import ConfigurationError
 from app.clients.erpnext_errors import (
     ERPNextDuplicateCreatedError,
     ERPNextPartialWriteError,
@@ -11,7 +13,7 @@ from app.clients.erpnext_errors import (
 )
 from app.clients.ghl_errors import GHLNotFoundError
 from app.config import Settings
-from app.models import Customer
+from app.models import Customer, Deal, StockLevel
 
 DRY_RUN_HEADER = "mode: dry run (nothing will be written; use --apply to write)"
 APPLY_HEADER = "mode: APPLY (will write to ERPNext if needed)"
@@ -271,3 +273,201 @@ def test_clients_are_closed_even_when_the_sync_fails(monkeypatch: pytest.MonkeyP
     assert code == 3
     assert contacts.closed
     assert erp.closed
+
+
+# --- the serve command ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def served(monkeypatch: pytest.MonkeyPatch) -> list[tuple[object, str, int]]:
+    """Replace the real app and the real server, recording what would have been started."""
+    calls: list[tuple[object, str, int]] = []
+    sentinel = object()
+    monkeypatch.setattr(cli, "create_app", lambda: sentinel)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda app, host, port: calls.append((app, host, port)))
+    return calls
+
+
+def test_serve_listens_locally_on_port_8000_by_default(served: list) -> None:
+    out, err = io.StringIO(), io.StringIO()
+
+    code = cli.main(["serve"], out=out, err=err)
+
+    assert code == 0
+    assert [(host, port) for _, host, port in served] == [("127.0.0.1", 8000)]
+    assert out.getvalue() == ""  # no "mode: dry run" header: that belongs to `sync`
+
+
+def test_serve_accepts_a_host_and_port(served: list) -> None:
+    code = cli.main(["serve", "--host", "0.0.0.0", "--port", "9100"], out=io.StringIO())
+
+    assert code == 0
+    assert [(host, port) for _, host, port in served] == [("0.0.0.0", 9100)]
+
+
+def test_serve_reports_missing_settings_and_does_not_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started: list[object] = []
+
+    def refuse() -> None:
+        raise ConfigurationError(
+            "missing or invalid settings: webhook_secret (at least 16 characters)"
+        )
+
+    monkeypatch.setattr(cli, "create_app", refuse)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: started.append(args))
+    err = io.StringIO()
+
+    code = cli.main(["serve"], out=io.StringIO(), err=err)
+
+    assert code == 3
+    assert err.getvalue().splitlines() == [
+        "configuration error: missing or invalid settings: webhook_secret (at least 16 characters)"
+    ]
+    assert started == []
+
+
+def test_serve_prints_field_names_but_never_values_for_invalid_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("ERPNEXT_API_KEY", "ERPNEXT_API_SECRET", "GHL_API_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ERPNEXT_BASE_URL", "not a url SENSITIVE-VALUE")
+    with pytest.raises(ValidationError) as info:
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+    def broken() -> None:
+        raise info.value
+
+    monkeypatch.setattr(cli, "create_app", broken)
+    err = io.StringIO()
+
+    code = cli.main(["serve"], out=io.StringIO(), err=err)
+
+    assert code == 3
+    assert "erpnext_base_url" in err.getvalue()
+    assert "SENSITIVE-VALUE" not in err.getvalue()
+
+
+def test_serve_rejects_a_port_that_is_not_a_number(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["serve", "--port", "abc"]) == 2
+    assert "usage:" in capsys.readouterr().err
+
+
+# --- availability ---------------------------------------------------------------------------
+
+
+class FakeDeals:
+    def __init__(self, deal: Deal | None = None, error: Exception | None = None) -> None:
+        self.deal = deal or Deal(
+            id="opp1",
+            status="open",
+            pipeline_id="pipe1",
+            sku="AC-5TON-RTU",
+            quantity=Decimal(4),
+            warehouse="Dallas Warehouse - MAS",
+        )
+        self.error = error
+        self.written: list[tuple[str, str]] = []
+
+    def get_deal(self, opportunity_id: str) -> Deal:
+        if self.error:
+            raise self.error
+        return self.deal
+
+    def set_availability_note(self, opportunity_id: str, note: str) -> None:
+        self.written.append((opportunity_id, note))
+
+
+class FakeStock:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+
+    def get_stock(self, sku: str) -> list[StockLevel]:
+        if self.error:
+            raise self.error
+        return [
+            StockLevel(warehouse="Dallas Warehouse - MAS", on_hand=Decimal(7), reserved=Decimal(1))
+        ]
+
+
+def run_availability(argv, deals=None, stock=None, pipeline_id="pipe1"):
+    out, err = io.StringIO(), io.StringIO()
+    code = cli.main(
+        ["availability", "opp1", *argv],
+        deals=deals or FakeDeals(),
+        erp=stock or FakeStock(),
+        pipeline_id=pipeline_id,
+        out=out,
+        err=err,
+    )
+    return code, out.getvalue().splitlines(), err.getvalue()
+
+
+def test_availability_is_a_dry_run_by_default() -> None:
+    deals = FakeDeals()
+    code, lines, err = run_availability([], deals)
+
+    assert code == 0
+    assert lines[0] == DRY_RUN_HEADER
+    assert lines[1] == (
+        "available: OK: 6 available in Dallas Warehouse - MAS (need 4) [not written (dry run)]"
+    )
+    assert deals.written == [] and err == ""
+
+
+def test_availability_apply_writes_the_answer() -> None:
+    deals = FakeDeals()
+    code, lines, _ = run_availability(["--apply"], deals)
+
+    assert code == 0
+    assert lines[0] == "mode: APPLY (will write the answer onto the deal)"
+    assert lines[1].endswith("[written onto the deal]")
+    assert deals.written == [("opp1", "OK: 6 available in Dallas Warehouse - MAS (need 4)")]
+
+
+def test_short_stock_is_still_a_normal_answer() -> None:
+    deal = Deal(
+        id="opp1",
+        status="open",
+        pipeline_id="pipe1",
+        sku="X",
+        quantity=Decimal(20),
+        warehouse="Dallas Warehouse - MAS",
+    )
+    code, lines, _ = run_availability([], FakeDeals(deal))
+    assert code == 0
+    assert lines[1].startswith("short: SHORT: 6 available")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "start"),
+    [({"sku": None}, "incomplete_deal:"), ({"pipeline_id": "other"}, "wrong_pipeline:")],
+)
+def test_outcomes_that_need_a_person_exit_1(overrides: dict, start: str) -> None:
+    deal = FakeDeals().deal.model_copy(update=overrides)
+    deals = FakeDeals(deal)
+    code, lines, _ = run_availability(["--apply"], deals)
+
+    assert code == 1
+    assert lines[1].startswith(start)
+    if "pipeline_id" in overrides:
+        assert deals.written == []
+
+
+def test_availability_service_errors_exit_3_without_details() -> None:
+    deals = FakeDeals(error=GHLNotFoundError("GoHighLevel returned HTTP 404"))
+    code, _, err = run_availability([], deals)
+    assert code == 3
+    assert err == "error: GHLNotFoundError: GoHighLevel returned HTTP 404\n"
+
+
+def test_availability_needs_a_configured_pipeline() -> None:
+    code, _, err = run_availability([], pipeline_id="")
+    assert code == 3
+    assert err == "configuration error: missing or invalid settings: ghl_pipeline_id\n"
+
+
+def test_availability_needs_an_opportunity_id() -> None:
+    assert cli.main(["availability"], out=io.StringIO(), err=io.StringIO()) == 2

@@ -17,8 +17,16 @@ class Settings(BaseSettings):
     # GoHighLevel requires a Version header; kept configurable because docs differ on its value.
     ghl_api_version: str = "2021-07-28"
 
+    # The one pipeline OrderBridge may act on. Deals in any other pipeline are ignored, even if a
+    # workflow is misconfigured. Required to run the webhook server and the availability command.
+    ghl_pipeline_id: str | None = None
+
     # Optional: the CLI and the clients work without a database.
     database_url: SecretStr | None = None
+
+    # Optional: required only to run the webhook server (`python -m app serve`). GoHighLevel's
+    # workflow sends it in the X-Webhook-Secret header.
+    webhook_secret: SecretStr | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",

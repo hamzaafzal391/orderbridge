@@ -1,5 +1,7 @@
 from typing import ClassVar
 
+from app.errors import UnknownItemError
+
 
 class ERPNextError(Exception):
     """Base class for every failure at the ERPNext client boundary.
@@ -22,6 +24,10 @@ class ERPNextAuthenticationError(ERPNextError):
 
 class ERPNextNotFoundError(ERPNextError):
     """404: the requested record does not exist. Never retry."""
+
+
+class ERPNextItemNotFoundError(ERPNextNotFoundError, UnknownItemError):
+    """No item with that code exists in ERPNext (found by looking, not from an HTTP 404)."""
 
 
 class ERPNextRateLimitError(ERPNextError):

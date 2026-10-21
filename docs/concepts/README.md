@@ -28,9 +28,10 @@ New to a word? See the [glossary](glossary.md).
 | 13 | [CI and branch protection](13-ci-and-branch-protection.md) | A robot checks every change |
 | 14 | [Pull requests and decision records](14-pull-requests-and-adrs.md) | Small changes, written reasons |
 | 15 | [Idempotency keys and the database](15-idempotency-keys-and-the-database.md) | A shared row decides who does the work |
+| 16 | [Webhooks and shared secrets](16-webhooks-and-shared-secrets.md) | A doorbell, and a password at the door |
 
-Planned but not built yet (so not covered here as facts): the FastAPI webhook endpoint, using the
-stored keys inside the sync flow, Docker and AWS deployment.
+Planned but not built yet (so not covered here as facts): creating the Sales Order, the credit
+check, writing back to the CRM, Docker and AWS deployment.
 
 The project's decision records live in [`../adr/`](../adr/); these notes explain the ideas behind
 them in plainer words.
