@@ -43,7 +43,8 @@ to remember what has already been done, so full idempotency keys have to wait.
   and the loser gets `name_conflict`.
 - Check-then-create is not atomic: two runs at the same moment can both pass the name check.
   The post-check detects the resulting numbered duplicate afterwards; preventing it needs the
-  database or a lock (planned).
+  database or a lock. The database foundation for this is built in
+  [ADR 0006](0006-postgresql-idempotency-keys-links-audit.md); wiring it in is a later step.
 
 ## Correction (2026-10-20)
 

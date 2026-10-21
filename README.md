@@ -69,7 +69,7 @@ Business logic never talks to a vendor API directly. Vendor-specific code lives 
 | Create the missing ERPNext customer (never retried, checks for an existing name first; dry-run mode) | Done, verified against a live ERPNext |
 | Retries with backoff for safe reads (temporary and rate-limit errors) | Done |
 | `python -m app sync` command line (dry run by default) | Done |
-| PostgreSQL foundation: idempotency keys, object links, audit log | Planned (next) |
+| PostgreSQL foundation: idempotency keys, object links, audit log (built and tested; not yet used by the sync flow) | Done |
 | FastAPI webhook endpoint for "deal won" | Planned |
 | Deal to ERPNext Sales Order (one equipment line) | Planned |
 | Credit-limit check: draft order and credit hold when over the limit | Planned |
@@ -142,6 +142,22 @@ names may be shown; emails, tokens and credentials never are.
 | 2 | bad usage |
 | 3 | configuration problem or service error |
 
+### Database (optional)
+
+PostgreSQL stores idempotency keys, object links and an audit log. The CLI and the clients work
+without it.
+
+```bash
+docker compose up -d db                     # local PostgreSQL on localhost:5436
+export DATABASE_URL=postgresql+psycopg://orderbridge:orderbridge@localhost:5436/orderbridge
+alembic upgrade head                        # create the tables
+DATABASE_URL_TEST=postgresql+psycopg://orderbridge:orderbridge@localhost:5436/orderbridge_test \
+  pytest -m integration                     # tests against the real database
+```
+
+The credentials in `docker-compose.yml` are for that throwaway local container only. The default
+`pytest` run stays offline and skips the integration tests.
+
 ## Project layout
 
 ```
@@ -150,6 +166,7 @@ app/
 ├── cli.py                  # command line: `sync <contact_id> [--apply]`
 ├── config.py               # settings loaded from environment / .env
 ├── models.py               # OrderBridge's own vendor-independent models (Customer)
+├── db/                     # PostgreSQL: tables, session, repository (claim, links, audit)
 ├── retry.py                # bounded retries with backoff (reads only)
 ├── services/
 │   ├── customer_matching.py  # business logic: match a CRM contact to an ERP customer
@@ -161,9 +178,12 @@ app/
     ├── ghl.py              # GoHighLevel HTTP client; converts contacts to Customer
     ├── ghl_errors.py       # GoHighLevel error hierarchy
     └── ghl_models.py       # GoHighLevel response shapes used for validation
+migrations/                 # Alembic database migrations
 tests/unit/                 # fast tests, no network
+tests/integration/          # tests against a real PostgreSQL (marked, run separately)
+docker-compose.yml          # local PostgreSQL for development
 docs/adr/                   # architecture decision records
-.github/workflows/ci.yml    # lint, format check and tests on every PR
+.github/workflows/ci.yml    # checks (lint, format, unit tests) and integration (PostgreSQL)
 ```
 
 ## Workflow

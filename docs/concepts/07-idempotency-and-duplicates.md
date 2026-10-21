@@ -31,7 +31,8 @@ OrderBridge is safe against duplicates "by construction":
 [ADR 0004](../adr/0004-writes-never-retried-no-duplicates.md).
 
 **Known gap:** two runs at the exact same moment can both pass step 2. Fully closing it needs a
-stored key or a lock in a database (planned, not built).
+stored key or a lock in a database. That foundation now exists and is tested
+([page 15](15-idempotency-keys-and-the-database.md)); using it inside the sync flow is the next step.
 
 ## Check yourself
 

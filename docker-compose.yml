@@ -1,0 +1,28 @@
+# Local development database. The credentials below are for this throwaway local container
+# only (it listens on localhost); never reuse them anywhere real.
+#
+#   docker compose up -d db
+#   DATABASE_URL=postgresql+psycopg://orderbridge:orderbridge@localhost:5436/orderbridge
+#
+# Host port 5436 avoids 5432-5435, which other local projects commonly use.
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: orderbridge
+      POSTGRES_PASSWORD: orderbridge
+      POSTGRES_DB: orderbridge
+    ports:
+      - "127.0.0.1:5436:5432"
+    volumes:
+      - orderbridge-db-data:/var/lib/postgresql/data
+      # Creates a second database, orderbridge_test, for the integration tests.
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orderbridge -d orderbridge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  orderbridge-db-data:
