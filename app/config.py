@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     # Optional: the CLI and the clients work without a database.
     database_url: SecretStr | None = None
 
+    # Optional: required only to run the webhook server (`python -m app serve`). GoHighLevel's
+    # workflow sends it in the X-Webhook-Secret header.
+    webhook_secret: SecretStr | None = None
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

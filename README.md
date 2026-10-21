@@ -70,7 +70,7 @@ Business logic never talks to a vendor API directly. Vendor-specific code lives 
 | Retries with backoff for safe reads (temporary and rate-limit errors) | Done |
 | `python -m app sync` command line (dry run by default) | Done |
 | PostgreSQL foundation: idempotency keys, object links, audit log (built and tested; not yet used by the sync flow) | Done |
-| FastAPI webhook endpoint for "deal won" | Planned |
+| FastAPI webhook for "deal won": secret-protected, claims an idempotency key, makes sure the customer exists, records an audit trail (the Sales Order is the next step) | Done |
 | Deal to ERPNext Sales Order (one equipment line) | Planned |
 | Credit-limit check: draft order and credit hold when over the limit | Planned |
 | Write-back to GoHighLevel (order number, stage) | Planned |
@@ -142,6 +142,27 @@ names may be shown; emails, tokens and credentials never are.
 | 2 | bad usage |
 | 3 | configuration problem or service error |
 
+### Webhook server
+
+A GoHighLevel workflow calls OrderBridge when a deal is marked Won. The server needs the database
+and a shared secret (at least 16 characters) in your `.env`:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"   # use the output as WEBHOOK_SECRET
+python -m app serve                                           # listens on 127.0.0.1:8000
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/webhooks/ghl/deal-won \
+  -H "X-Webhook-Secret: $WEBHOOK_SECRET" -H "Content-Type: application/json" \
+  -d '{"opportunity_id": "opp-1", "contact_id": "<a GoHighLevel contact ID>"}'
+```
+
+The same deal sent twice, or at the same instant, is processed once. Wrong or missing secret: 401.
+Temporary problem: 503. Setup steps for GoHighLevel are in
+[`docs/demo/ghl-webhook-setup.md`](docs/demo/ghl-webhook-setup.md) (not yet verified against a real
+workflow).
+
 ### Database (optional)
 
 PostgreSQL stores idempotency keys, object links and an audit log. The CLI and the clients work
@@ -163,14 +184,16 @@ The credentials in `docker-compose.yml` are for that throwaway local container o
 ```
 app/
 ├── __main__.py             # makes `python -m app` work
-├── cli.py                  # command line: `sync <contact_id> [--apply]`
+├── api.py                  # webhook server: POST /webhooks/ghl/deal-won, GET /health
+├── cli.py                  # command line: `sync <contact_id> [--apply]`, `serve`
 ├── config.py               # settings loaded from environment / .env
 ├── models.py               # OrderBridge's own vendor-independent models (Customer)
 ├── db/                     # PostgreSQL: tables, session, repository (claim, links, audit)
 ├── retry.py                # bounded retries with backoff (reads only)
 ├── services/
 │   ├── customer_matching.py  # business logic: match a CRM contact to an ERP customer
-│   └── customer_sync.py      # business logic: create the ERP customer if none exists
+│   ├── customer_sync.py      # business logic: create the ERP customer if none exists
+│   └── deal_won.py           # business logic: handle a won deal exactly once
 └── clients/
     ├── erpnext.py          # ERPNext HTTP client; converts ERPNext data to Customer
     ├── erpnext_errors.py   # ERPNext error hierarchy

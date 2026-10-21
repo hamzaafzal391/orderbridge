@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from app import cli
+from app.api import ConfigurationError
 from app.clients.erpnext_errors import (
     ERPNextDuplicateCreatedError,
     ERPNextPartialWriteError,
@@ -271,3 +272,83 @@ def test_clients_are_closed_even_when_the_sync_fails(monkeypatch: pytest.MonkeyP
     assert code == 3
     assert contacts.closed
     assert erp.closed
+
+
+# --- the serve command ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def served(monkeypatch: pytest.MonkeyPatch) -> list[tuple[object, str, int]]:
+    """Replace the real app and the real server, recording what would have been started."""
+    calls: list[tuple[object, str, int]] = []
+    sentinel = object()
+    monkeypatch.setattr(cli, "create_app", lambda: sentinel)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda app, host, port: calls.append((app, host, port)))
+    return calls
+
+
+def test_serve_listens_locally_on_port_8000_by_default(served: list) -> None:
+    out, err = io.StringIO(), io.StringIO()
+
+    code = cli.main(["serve"], out=out, err=err)
+
+    assert code == 0
+    assert [(host, port) for _, host, port in served] == [("127.0.0.1", 8000)]
+    assert out.getvalue() == ""  # no "mode: dry run" header: that belongs to `sync`
+
+
+def test_serve_accepts_a_host_and_port(served: list) -> None:
+    code = cli.main(["serve", "--host", "0.0.0.0", "--port", "9100"], out=io.StringIO())
+
+    assert code == 0
+    assert [(host, port) for _, host, port in served] == [("0.0.0.0", 9100)]
+
+
+def test_serve_reports_missing_settings_and_does_not_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started: list[object] = []
+
+    def refuse() -> None:
+        raise ConfigurationError(
+            "missing or invalid settings: webhook_secret (at least 16 characters)"
+        )
+
+    monkeypatch.setattr(cli, "create_app", refuse)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: started.append(args))
+    err = io.StringIO()
+
+    code = cli.main(["serve"], out=io.StringIO(), err=err)
+
+    assert code == 3
+    assert err.getvalue().splitlines() == [
+        "configuration error: missing or invalid settings: webhook_secret (at least 16 characters)"
+    ]
+    assert started == []
+
+
+def test_serve_prints_field_names_but_never_values_for_invalid_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("ERPNEXT_API_KEY", "ERPNEXT_API_SECRET", "GHL_API_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ERPNEXT_BASE_URL", "not a url SENSITIVE-VALUE")
+    with pytest.raises(ValidationError) as info:
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+    def broken() -> None:
+        raise info.value
+
+    monkeypatch.setattr(cli, "create_app", broken)
+    err = io.StringIO()
+
+    code = cli.main(["serve"], out=io.StringIO(), err=err)
+
+    assert code == 3
+    assert "erpnext_base_url" in err.getvalue()
+    assert "SENSITIVE-VALUE" not in err.getvalue()
+
+
+def test_serve_rejects_a_port_that_is_not_a_number(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["serve", "--port", "abc"]) == 2
+    assert "usage:" in capsys.readouterr().err
